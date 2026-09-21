@@ -26,7 +26,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import * as P from "../protocol";
-import { dispatchTasks, type DispatcherInfo, type DispatchedTaskResult } from "../dispatch";
+import { dispatchTasks, waitForTasks, type DispatcherInfo, type DispatchedTaskResult } from "../dispatch";
 import { BATTERY, runOracle, type BatteryEntry, type OracleVerdict } from "./battery";
 import { collectRow, mediansOf, type BenchRow } from "./collector";
 import { renderMedians, renderTable } from "./report";
@@ -152,6 +152,23 @@ export async function runLive(opts: LiveOptions = {}, out: (l: string) => void =
 						deps: { tickMs },
 					});
 					res = r.results[0];
+					// the async contract: the call returned before settlement —
+					// wait in-process (the factored loop) for the terminal state
+					// before the oracle/collector run
+					if (res !== undefined) {
+						const w = await waitForTasks({
+							ids: [res.id],
+							mode,
+							bunBin,
+							lease: { owner: info.sessionId, nonce: "bench-live-wait" },
+							deps: { tickMs },
+						});
+						const ws = w.states[0];
+						if (ws !== undefined) {
+							res.state = ws.state;
+							res.reason = ws.reason;
+						}
+					}
 				} catch (e) {
 					// a dispatch-level failure (bad agent, no compositor, …) is a
 					// failed run, not a driver error — the suite continues

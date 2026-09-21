@@ -3,9 +3,12 @@
  *
  * One package, two roles, switched by env ("The worker-mode extension"):
  * - dispatcher sessions: registers the `vitrine_dispatch` tool — admit, spawn,
- *   watch, harvest. The mode is the protocol's decision, not a second
- *   probe: the compositor reachability probe (tool-side only) picks the spawn
- *   shape — tile if reachable, headless otherwise, never the reverse.
+ *   return (the async contract: the tool path never waits; the harvest is
+ *   reported on settlement as a delivery, and the queue is owned by the
+ *   session's watcher from the pass onward). The mode is the protocol's
+ *   decision, not a second probe: the compositor reachability probe
+ *   (tool-side only) picks the spawn shape — tile if reachable, headless
+ *   otherwise, never the reverse.
  * - worker mode (`VITRINE_TASK_DIR` in env): registers exactly one tool,
  *   `vitrine_done(answer, data?)` — writes `result.md` (+ `result.json` when
  *   `data` is present) + `done.marker` and one `events.jsonl` line; never
@@ -61,9 +64,9 @@ const doneRenderers = makeDoneRenderers(doneRenderDeps);
 const DISPATCH_MECHANICS =
 	"Dispatch one or more tasks to specialist agents (pi agent files), each in its own visible workspace " +
 	"(a Hyprland/foot tile when the compositor is reachable, otherwise a headless background worker). " +
-	"Blocks until every task reaches a terminal state (or the turn is aborted — workers keep running; " +
-	"re-dispatch or use the `vitrine` CLI to check on them). Returns compact per-task results: state, " +
-	"elapsed, harvested answer (capped), and the session handle. " +
+	"Returns immediately after the spawn/admission pass — per task: short id, agent, and state (running or " +
+	"queued). Each task's harvest is reported on settlement as a delivery; it never lands in the tool " +
+	"result — do not act on a worker's result in the same turn you dispatched it. " +
 	"pi's docs call starting a new agent 'spawn' — this is that spawn: it starts one worker per task and dispatches the task to it.";
 
 /**
@@ -90,6 +93,7 @@ export function composeDispatchDescription(): string {
 	}
 	parts.push(
 		"Dispatch when a side task would flood this context, for parallel mechanical units, or for an independent check; not for a single sequential unit or judgment work that needs the conversation.\n" +
+			"Dispatch returns immediately — each task's result arrives as a delivery on settlement; never act on a worker's result in the same turn you dispatched it, and never busy-wait for it.\n" +
 			"Project-local `.pi/agents/` agents shadow these when the project is trusted; an unknown-agent error lists the live roster.",
 	);
 	return parts.join("\n\n");
@@ -180,6 +184,19 @@ export default function vitrine(pi: ExtensionAPI): void {
 				// AgentToolResult carries no isError field, so throwing is the
 				// contract-faithful error path (a string result is a success to pi).
 				const d = await P.assertTaskDir(taskDir);
+				// The resume commit (R12): a second `vitrine_done` on an already-
+				// terminal task is an idempotent no-op — the done marker is
+				// write-once, so the handler short-circuits: NO event, no state
+				// change, no re-recording. (A confused worker repeating the call
+				// gets a plain acknowledgement, not an error — and a human-resumed
+				// session keeps talking after settlement without re-settling.)
+				const existingMarker = await P.readDoneMarker(d);
+				if (existingMarker !== null) {
+					return {
+						content: [{ type: "text", text: `Already settled: the answer was recorded on an earlier vitrine_done (marker source: ${existingMarker.source}) — this call is a no-op (no event, no state change). Stop immediately.` }],
+						details: { noop: true, source: existingMarker.source },
+					};
+				}
 				// The typed-harvest contract: when the dispatch declared an
 				// `output_schema`, `data` is REQUIRED and must satisfy the schema
 				// — validated at the call (fail-fast) so the worker retries with a
@@ -280,7 +297,9 @@ export default function vitrine(pi: ExtensionAPI): void {
 			_toolCallId: string,
 			params: Record<string, unknown>,
 			signal: AbortSignal,
-			onUpdate?: (update: { content: Array<{ type: "text"; text: string }>; details?: unknown }) => void,
+			// pi's streaming callback — unused by the async contract (R1): the
+			// tool returns after the spawn pass, there is nothing to stream.
+			_onUpdate?: (update: { content: Array<{ type: "text"; text: string }>; details?: unknown }) => void,
 			ctx?: ExtensionToolContext,
 		): Promise<ToolResult> {
 			if (ctx === undefined) {
@@ -296,6 +315,12 @@ export default function vitrine(pi: ExtensionAPI): void {
 			// Mode: the compositor reachability probe. Unreachable ⇒
 			// headless, never the reverse.
 			const mode = (await D.probeCompositor()) ? "tile" : "headless";
+			// The async contract (R1): the tool returns after the spawn/
+			// admission pass — no in-call wait, NO harvest in the result.
+			// The harvest of every task is reported on settlement (the
+			// delivery); the queue is owned by the session's watcher from
+			// here (R2). `details.results` rides the session record as the
+			// machine-readable twin of the text.
 			const report = await D.dispatchTasks({
 				tasks: params.tasks as D.DispatchTaskInput[],
 				mode,
@@ -303,12 +328,11 @@ export default function vitrine(pi: ExtensionAPI): void {
 				bunBin: D.resolveBunBin, // thunk: resolved lazily at the first headless spawn (tile never resolves it)
 				deps: {
 					signal,
-					onUpdate: (s) => onUpdate?.({ content: [{ type: "text", text: s }], details: { mode } }),
 				},
 			});
 			// A plain-string result crashes pi's TUI and is dropped from the
 			// session record — return the ToolResult object (verified 2026-09-17).
-			return { content: [{ type: "text", text: report.text }], details: { mode } };
+			return { content: [{ type: "text", text: report.text }], details: { mode, results: report.results } };
 		},
 	});
 

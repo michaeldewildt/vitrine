@@ -233,6 +233,22 @@ describe("gc", () => {
 		const r = await runCli(["gc"], { ...QUIET, now: () => NOW });
 		expect(r.lines).toContain("gc: nothing to remove");
 	});
+
+	it("an undelivered async task dir is never gc'd (the delivery owns it until the harvest-delivered marker)", async () => {
+		const dir = await newTask({ async: true });
+		await P.transitionState(dir, "queued", "running", {});
+		await P.transitionState(dir, "running", "completed", {}, "done");
+		// age it 15 days — past the retention window; without the skip it would be pruned
+		const st = await P.readState(dir);
+		st.finished_at = new Date(NOW - 15 * 24 * 3600 * 1000).toISOString();
+		await writeFile(join(dir, "state.json"), JSON.stringify(st, null, 2) + "\n");
+		const r = await runCli(["gc"], { ...QUIET, now: () => NOW });
+		expect(r.lines).toContain("gc: nothing to remove");
+		// once the delivery writes the marker, the plain retention rule applies again
+		await P.writeHarvestDelivered(dir, "batch-x");
+		const r2 = await runCli(["gc"], { ...QUIET, now: () => NOW });
+		expect(r2.lines.join("\n")).toContain("removed " + P.taskIdOf(dir));
+	});
 });
 
 describe("gc --dry-run", () => {

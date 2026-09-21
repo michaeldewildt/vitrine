@@ -1,24 +1,33 @@
 /**
  * core.ts — the dispatch core: the tool-call surface (types +
  * `DispatchError`), `dispatchTasks` (validate → reconcile → admit →
- * resolve/create → spawn+wait → results + deferred harvest → the report),
- * and the model-facing report renderer.
+ * resolve/create → the one-shot spawn pass → the R1 report), and the
+ * model-facing report renderer.
+ *
+ * The async contract (R1): the tool path returns after the spawn/admission
+ * pass — the admitted tasks spawn now, the rest queue under their owner
+ * lease — and carries NO harvest. The harvest of every task is reported on
+ * settlement (the delivery); the session-scoped watcher owns the queue
+ * (admitting as slots free, spawning, refreshing the leases — R2) and the
+ * bench drivers (R10) drive the factored wait loop in-process. The old
+ * in-call wait-and-harvest loop is gone from the tool path; its machinery
+ * lives in `loop.ts` (the wait) and `harvest.ts` (the harvest — now the
+ * watcher/collect's, not the tool's).
  *
  * The collaborators live beside it: `spawn.ts` (the tile argv + the join
- * juggle + the headless bun resolution + the formatting pieces), `harvest.ts`
- * (the result harvest + the deferred-harvest registry), `admit.ts` (the
+ * juggle + `issueSpawn` + the headless bun resolution + the formatting
+ * pieces), `loop.ts` (the reusable wait loop), `harvest.ts` (the result
+ * harvest + the deferred-harvest registry), `admit.ts` (the
  * liveness-qualified slot count + reconciliation).
  */
-import { spawn } from "node:child_process";
 import { stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import * as P from "../protocol";
 import * as C from "../config";
 import { listAgentSummaries, resolveAgent } from "../agents";
 import { defaultHyprctl, type HyprctlResult } from "../hyprctl";
-import { formatElapsed, promptHeader, shortId, spawnTileWithJoin, tileSpawnArgv } from "./spawn";
+import { issueSpawn, shortId, promptHeader, type SpawnEnv } from "./spawn";
 import type { PanelDeps } from "./panel";
-import { harvestTask, pendingDispatchedIds, registryAdd, registryRemove, type Harvest } from "./harvest";
 import { countSlots, nonTerminalTasks, reconcileAll } from "./admit";
 
 // ---------------------------------------------------------------------------
@@ -73,7 +82,7 @@ export interface DispatchDeps {
 	now?: () => number;
 	/** Sleep (default `setTimeout`). */
 	sleep?: (ms: number) => Promise<void>;
-	/** Poll tick (default 1000 ms, Waiting). */
+	/** Poll tick (default 1000 ms — the wait loop's; the entry itself never waits). */
 	tickMs?: number;
 	/** Join-juggle map-wait budget (default 2000 ms, Spawn). */
 	mapWaitMs?: number;
@@ -84,14 +93,6 @@ export interface DispatchDeps {
 	panel?: PanelDeps;
 	/** The extension's AbortSignal (probed: it flips on turn abort). */
 	signal?: AbortSignal;
-	/** Progress sink (the extension's `onUpdate`). */
-	onUpdate?: (progress: string) => void;
-	/** Model-facing result cap, bytes (default 50 KB). */
-	maxResultBytes?: number;
-	/** Model-facing result cap, lines (default 2000). */
-	maxResultLines?: number;
-	/** Overflow-file root (default `os.tmpdir()`). */
-	tmpDir?: string;
 }
 
 export const MAX_TASKS_PER_CALL = 8;
@@ -115,47 +116,35 @@ export interface DispatchOptions {
 	deps?: DispatchDeps;
 }
 
+/**
+ * One task's result in the R1 return shape: the short id + agent + the
+ * state observed AFTER the spawn/admission pass — `running` or `queued`
+ * (a spawn that failed in the pass settled `crashed`/`failed-to-spawn`
+ * immediately). The result carries NO harvest — the harvest is reported
+ * on settlement, never in the tool result (R1).
+ */
 export interface DispatchedTaskResult {
+	/** The task id (the dir under the tasks root). */
 	id: string;
 	agent: string;
 	state: P.TaskState;
 	reason?: string;
-	/** Elapsed ms (created_at → finished_at, or the abort time). */
-	elapsedMs: number;
-	/** The harvested text (capped). */
-	result?: string;
-	/** True for killed/crashed/timeout/failed — the partial is labelled as such. */
-	partial?: boolean;
-	/** The 0600 overflow file (the capped result names it). */
-	overflowFile?: string;
-	/** The typed data (the worker's `vitrine_done` `data`, the parsed `result.json`) — machine-readable, uncapped. */
-	data?: unknown;
-	/** The data for the report (compact JSON, 8 KB-capped; the capped text names its overflow file). */
-	dataText?: string;
-	/** The 0600 overflow file for the capped data. */
-	overflowDataFile?: string;
-	/** True when this call queued the item and it ran after a slot freed. */
-	queuedThisCall?: boolean;
-	/** True when adopted (live at admission, not dispatched this call). */
-	adopted?: boolean;
-	/** True when settled `never-spawned` (abort path or the 15 s rule). */
-	neverSpawned?: boolean;
+	/** True when the pass queued the task past the slot cap — the session's watcher spawns it as a slot frees (the queue is live under the owner lease, R2). */
+	queued?: boolean;
 	/** `vitrine.<id>` — the session handle. */
 	sessionId: string;
 }
 
 export interface DispatchReport {
 	mode: "tile" | "headless";
+	/** The number of tasks created (every input task becomes a task dir). */
 	dispatched: number;
 	results: DispatchedTaskResult[];
-	/** Items queued within the call (overflow past the cap). */
-	queuedThisCall: number;
-	/** Adopted live tasks (reported in the header). */
-	adopted: DispatchedTaskResult[];
-	/** Deferred harvests (non-terminal at admission, terminal now). */
-	deferred: DispatchedTaskResult[];
+	/** Tasks queued past the slot cap (spawned as slots free). */
+	queued: number;
+	/** True when the abort signal had already flipped: the spawn pass was skipped (no work added to a dying turn) — the created tasks stay queued under their lease for the session's watcher. */
 	aborted: boolean;
-	/** The model-facing text (result shape). */
+	/** The model-facing text (the R1 shape). */
 	text: string;
 }
 
@@ -163,29 +152,27 @@ export interface DispatchReport {
 // the dispatch core
 
 interface PlannedTask {
-	input: DispatchTaskInput;
 	id: string;
 	dir: string;
 	spec: P.TaskSpec;
 	agentName: string;
+	/** The admission decision (index past the free slots at admission). */
 	queuedThisCall: boolean;
-	spawnIssued: boolean;
-	seenState: P.TaskState;
-	seenReason?: string;
-	elapsedFrom: string;
 }
 
 /**
- * The dispatch core. Validates + creates the task dirs, admits against the
- * liveness-qualified slot cap, spawns (tile: hyprctl argv; headless:
- * detached wrapper spawn), then polls until every admitted+queued task is
- * terminal (or the abort signal fires). Returns the model-facing report.
+ * The dispatch core, the async contract (R1): validates the surface,
+ * reconciles, admits against the liveness-qualified slot cap, creates the
+ * task dirs (spec + prompt + `queued` state + the owner lease + the
+ * delivery-eligibility marker), runs the one-shot spawn pass (the admitted
+ * tasks spawn now; the rest queue), and returns the per-task report. It
+ * NEVER waits: the harvest arrives as a delivery on settlement, and the
+ * queue is owned by the session's watcher from here (R2).
  */
 export async function dispatchTasks(opts: DispatchOptions): Promise<DispatchReport> {
 	const deps = opts.deps ?? {};
 	const now = deps.now ?? Date.now;
 	const sleep = deps.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
-	const tickMs = deps.tickMs ?? 1000;
 	const mapWaitMs = deps.mapWaitMs ?? 2000;
 	const mapWaitTickMs = deps.mapWaitTickMs ?? 200;
 	const hyprctl = deps.hyprctl ?? defaultHyprctl();
@@ -215,6 +202,7 @@ export async function dispatchTasks(opts: DispatchOptions): Promise<DispatchRepo
 	// Per-call lease identity (one session can have concurrent dispatch calls —
 	// the lease claim is per-call, so each call owns only its own tasks).
 	const callNonce = P.newTaskId();
+	const env: SpawnEnv = { mode: opts.mode, cfg, bunBin: opts.bunBin, hyprctl, sleep, now, mapWaitMs, mapWaitTickMs, panel: deps.panel };
 
 	// ---- reconcile first (before admission) -------------------------
 	await reconcileAll(now());
@@ -226,73 +214,6 @@ export async function dispatchTasks(opts: DispatchOptions): Promise<DispatchRepo
 
 	// ---- resolve agents + guards, create task dirs ---------------------------
 	const planned: PlannedTask[] = [];
-	const adopted: DispatchedTaskResult[] = [];
-	const deferred: DispatchedTaskResult[] = [];
-
-	// Adopt + deferred harvest: non-terminal tasks from other calls, and
-	// registry ids this session dispatched but never saw terminal.
-	const foreignDirs = await P.listTaskDirs();
-	const foreignQueued: Array<{ id: string; agent: string; sessionId: string; createdAt?: string }> = [];
-	const adoptedMeta = new Map<string, { createdAt?: string }>();
-	for (const dir of foreignDirs) {
-		const st = await P.readState(dir).catch(() => null);
-		if (st === null) continue;
-		const id = P.taskIdOf(dir);
-		if (st.state === "running") {
-			const live = await P.wrapperLiveness(dir, st);
-			if (live.live) {
-				// adopt (reported in the result header)
-				const spec = await P.readSpec(dir).catch(() => null);
-				adoptedMeta.set(id, { createdAt: spec?.created_at });
-				adopted.push({
-					id,
-					agent: spec?.agent.name ?? "?",
-					state: "running",
-					elapsedMs: st.started_at !== undefined ? now() - Date.parse(st.started_at) : 0,
-					sessionId: spec?.session_id ?? "vitrine.?",
-					adopted: true,
-				});
-			}
-		} else if (st.state === "queued") {
-			// another call's in-flight queue (its dispatcher may not have
-			// spawned it yet): snapshot it for the post-loop deferred harvest
-			// (a foreign queued task that goes terminal while this
-			// call waits gets its result here; the registry covers only the
-			// same session, this covers cross-session)
-			const spec = await P.readSpec(dir).catch(() => null);
-			foreignQueued.push({ id, agent: spec?.agent.name ?? "?", sessionId: spec?.session_id ?? "vitrine.?", createdAt: spec?.created_at });
-		}
-	}
-	// deferred harvest: registry ids that are terminal now
-	for (const id of pendingDispatchedIds(info.sessionId)) {
-		const dir = join(P.tasksRoot(), id);
-		const st = await P.readState(dir).catch(() => null);
-		if (st === null) {
-			// the dir is gone (gc'd, or removed externally): nothing to harvest,
-			// and the id can never become harvestable — drop the registry entry
-			// or it would linger for the life of the session (and the next call
-			// would re-check the same vanished dir, forever)
-			registryRemove(info.sessionId, id);
-			continue;
-		}
-		if (P.isTerminal(st.state)) {
-			const spec = await P.readSpec(dir).catch(() => null);
-			const h = await harvestTask(dir, st.state, deps);
-			deferred.push({
-				id,
-				agent: spec?.agent.name ?? "?",
-				state: st.state,
-				reason: st.reason,
-				elapsedMs: st.finished_at !== undefined && spec?.created_at ? Date.parse(st.finished_at) - Date.parse(spec.created_at) : 0,
-				result: h.text,
-				partial: h.partial,
-				overflowFile: h.overflowFile,
-				sessionId: spec?.session_id ?? `vitrine.${id}`,
-			});
-			registryRemove(info.sessionId, id);
-		}
-	}
-
 	for (let i = 0; i < opts.tasks.length; i++) {
 		const input = opts.tasks[i];
 		const id = P.newTaskId();
@@ -380,313 +301,91 @@ export async function dispatchTasks(opts: DispatchOptions): Promise<DispatchRepo
 			completed_close_s: cfg.completed_close_s,
 			from_task_id: fromTaskId,
 			from_session_file: fromSessionFile,
+			// the delivery-eligibility marker (the upgrade boundary): every
+			// task created from the async-dispatch change onward carries it;
+			// its absence on historical dirs is what excludes them from
+			// delivery, replay, and the gc-skip
+			async: true,
 			created_at: new Date(now()).toISOString(),
 			boot_id: bootId,
 		};
 		const prompt = `${promptHeader({ taskId: id, agent: agent.name, dispatcherSessionId: info.sessionId, cwd, fromTaskId })}\n${input.task}`;
 		await P.createTask(dir, spec, prompt);
 		// the owner claim (the stuck-queued gate): this call owns the lease
-		// from creation until the spawn is issued — refreshed every tick
+		// from creation; the session's watcher keeps refreshing it for the
+		// queue it owns from this call (freshness is what keeps a queue
+		// behind a slow worker a live queue, R2)
 		await P.writeLease(dir, { owner: info.sessionId, nonce: callNonce, updated_at: new Date(now()).toISOString() });
-		registryAdd(info.sessionId, [id]);
 
-		planned.push({
-			input,
-			id,
-			dir,
-			spec,
-			agentName: agent.name,
-			queuedThisCall,
-			spawnIssued: false,
-			seenState: "queued",
-			elapsedFrom: spec.created_at,
-		});
+		planned.push({ id, dir, spec, agentName: agent.name, queuedThisCall });
 	}
 
-	// ---- spawn + wait loop ----------------------------------------------------
-	// Per-tick order: reconcile → count → spawn → poll.
-	const spawnOne = async (p: PlannedTask): Promise<void> => {
-		// a spawn-command failure settles the task crashed/failed-to-spawn
-		// IMMEDIATELY in-call (no waiting out the 15 s window for a task that
-		// is known not to have launched).
-		const doSpawn = async (): Promise<boolean> => {
-			try {
-				if (opts.mode === "tile") {
-					// Window routing + grouping (main-agent group): a static
-					// Hyprland window rule keyed on app-id `vitrine-worker` opens the
-					// tile on the CURRENT workspace with `group = "set"` — the
-					// dispatcher places nothing. The main-agent join juggle finds the
-					// dispatcher's own panel (the window of the pi process running this
-					// tool), makes it a group if it isn't one (right before this spawn),
-					// focuses its group so the tile joins it at map time, then restores
-					// the user's focus after the map. Fail-soft: a juggle failure
-					// degrades to the tile opening as its own group; only the spawn
-					// itself settles failed-to-spawn.
-					// Tile mode needs a direct executable and never uses the bun
-					// binary, so the `bunBin` thunk is NOT evaluated here (a broken
-					// headless-box bun PATH must not break tiling).
-					const runPath = C.resolveRunPath(cfg, "tile");
-					const argv = tileSpawnArgv(p.agentName, p.id, runPath, p.dir);
-					const { spawnOk } = await spawnTileWithJoin(
-						async () => (await hyprctl(argv)).code === 0,
-						{ hyprctl, sleep, now, mapWaitMs, mapWaitTickMs, panel: deps.panel },
-					);
-					return spawnOk;
-				}
-				const runPath = C.resolveRunPath(cfg, "headless", opts.bunBin());
-				const child = spawn(runPath.command, [...runPath.args, p.dir], {
-					cwd: p.spec.cwd,
-					env: { ...process.env, ...C.wrapperRootEnv(cfg) },
-					detached: true,
-					stdio: "ignore",
-				});
-				child.unref();
-				return true;
-			} catch (e: unknown) {
-				await P.appendEvent(p.dir, { event: "spawn-failed", source: "dispatch", error: String(e) });
-				return false;
-			}
-		};
-		const ok = await doSpawn();
-		p.spawnIssued = true;
-		if (!ok) {
-			await P.transitionState(p.dir, "queued", "crashed", {}, "failed-to-spawn").catch(() => null);
-			p.seenState = "crashed";
-			p.seenReason = "failed-to-spawn";
-			await P.appendEvent(p.dir, { event: "failed-to-spawn", source: "dispatch" });
-		}
-	};
-
-	let aborted = false;
-	let lastProgressAt = 0;
-	// a fresh read each time (TS would otherwise narrow the property across
-	// the await and flag the second check)
-	const signalAborted = (): boolean => deps.signal?.aborted === true;
-
-	while (true) {
-		if (signalAborted()) {
-			aborted = true;
-			break;
-		}
-		// the call's own unspawned tasks are the in-call queue — excluded from
-		// the slot count (they become holders once their spawn is issued) and
-		// from reconciliation (a queue waiting on a full cap is not "stuck")
-		const notSpawned = new Set(planned.filter((p) => !p.spawnIssued).map((p) => p.id));
-		const notSpawnedDirs = new Set(planned.filter((p) => !p.spawnIssued).map((p) => p.dir));
-		// reconcile → count → spawn
-		await reconcileAll(now(), notSpawnedDirs);
-		// Refresh this call's leases for its own unspawned tasks — the claim
-		// that keeps a concurrent dispatch's reconcile from settling them:
-		// a live owner ticks (and thus refreshes); a dead one stops.
-		for (const dir of notSpawnedDirs) {
-			await P.writeLease(dir, { owner: info.sessionId, nonce: callNonce, updated_at: new Date(now()).toISOString() }).catch(() => null);
-		}
-		let slots = countSlots(await nonTerminalTasks(notSpawned), now());
+	// ---- the spawn pass (one pass — no wait) ---------------------------------
+	// The admitted tasks spawn now; the rest queue under their lease for the
+	// session's watcher (it admits them as slots free — R2). An abort signal
+	// that has already flipped skips the pass entirely: no work is added to a
+	// dying turn — the created tasks stay queued under their lease (the
+	// watcher owns them if the session lives; a dead session's stale lease
+	// settles them never-spawned — delivery is session-scoped, not turn-scoped).
+	let aborted = deps.signal?.aborted === true;
+	if (!aborted) {
 		for (const p of planned) {
-			if (p.spawnIssued) continue;
-			if (P.isTerminal(p.seenState)) continue;
-			if (slots >= cap) break;
-			// check the abort signal BEFORE the spawn decision
-			if (signalAborted()) {
-				aborted = true;
-				break;
-			}
-			await spawnOne(p);
-			if (!P.isTerminal(p.seenState)) slots++;
-		}
-		if (aborted) break;
-
-		// poll the states we own
-		let allTerminal = true;
-		for (const p of planned) {
-			const st = await P.readState(p.dir).catch(() => null);
-			// a failed read is NOT terminal evidence — keep waiting unless the
-			// task was already observed terminal (the dir cannot reappear;
-			// gc only removes settled tasks, and a vanished mid-call dir is
-			// the concurrent-gc case the harvest labels)
-			if (st === null) {
-				if (!P.isTerminal(p.seenState)) allTerminal = false;
-				continue;
-			}
-			if (st.state !== p.seenState || st.reason !== undefined && st.reason !== p.seenReason) {
-				p.seenState = st.state;
-				p.seenReason = st.reason;
-				if (P.isTerminal(st.state)) registryRemove(info.sessionId, p.id);
-			}
-			if (!P.isTerminal(st.state)) allTerminal = false;
-		}
-		if (allTerminal) break;
-
-		// progress (throttled to the tick)
-		const t0 = now();
-		if (t0 - lastProgressAt >= tickMs / 2) {
-			lastProgressAt = t0;
-			const lines = planned.map((p, i) => {
-				const age = formatElapsed(t0 - Date.parse(p.elapsedFrom));
-				return `[${i + 1}/${planned.length}] ${p.agentName} · ${shortId(p.id)} — ${p.seenState} (${age})${p.seenReason !== undefined ? ` ${p.seenReason}` : ""}`;
-			});
-			deps.onUpdate?.(lines.join("\n"));
-		}
-		await sleep(tickMs);
-	}
-
-	// ---- abort path (unspawned ⇒ never-spawned now) ------------------
-	if (aborted) {
-		for (const p of planned) {
-			if (!p.spawnIssued && p.seenState === "queued") {
-				await P.transitionState(p.dir, "queued", "crashed", {}, "never-spawned").catch(() => null);
-				p.seenState = "crashed";
-				p.seenReason = "never-spawned";
-			}
+			if (p.queuedThisCall) continue;
+			await issueSpawn({ id: p.id, dir: p.dir, agentName: p.agentName, spec: p.spec }, env);
 		}
 	}
 
-	// ---- results ----------------------------------------------------------------
+	// ---- the R1 result: the observed on-disk state after the pass ------------
+	// The tool result carries NO harvest — the state is what the pass left on
+	// disk (a headless/tile spawn is asynchronous: the wrapper flips
+	// queued→running on its own first tick, so `queued` at return time is the
+	// normal shape for a just-spawned task), and the harvest is reported on
+	// settlement (the delivery), never in the tool result. An aborted pass
+	// spawned nothing — every task is queued in effect, not just the ones the
+	// admission put past the cap.
 	const results: DispatchedTaskResult[] = [];
 	for (const p of planned) {
 		const st = await P.readState(p.dir).catch(() => null);
-		const state = st !== null ? st.state : p.seenState;
-		const reason = st?.reason ?? p.seenReason;
-		const finishedAt = st?.finished_at ?? (aborted ? new Date(now()).toISOString() : undefined);
-		const elapsedMs = finishedAt !== undefined ? Date.parse(finishedAt) - Date.parse(p.elapsedFrom) : now() - Date.parse(p.elapsedFrom);
-		const h: Harvest | null = P.isTerminal(state) ? await harvestTask(p.dir, state, deps) : null;
 		results.push({
 			id: p.id,
 			agent: p.agentName,
-			state,
-			reason,
-			elapsedMs,
-			result: h?.text,
-			partial: h?.partial || undefined,
-			overflowFile: h?.overflowFile,
-			data: h?.data,
-			dataText: h?.dataText,
-			overflowDataFile: h?.overflowDataFile,
-			queuedThisCall: p.queuedThisCall || undefined,
-			neverSpawned: reason === "never-spawned" ? true : undefined,
+			state: st !== null ? st.state : "queued",
+			reason: st?.reason,
+			queued: aborted || p.queuedThisCall ? true : undefined,
 			sessionId: p.spec.session_id,
 		});
 	}
 
-	// deferred harvest (the adopted branch): an adopted task that went
-	// terminal while this call waited gets its result now — this is how results
-	// come back after the dispatcher was aborted, restarted, or rebooted.
-	const deferredIds = new Set(deferred.map((d) => d.id));
-	for (const a of adopted) {
-		const dir = join(P.tasksRoot(), a.id);
-		const st = await P.readState(dir).catch(() => null);
-		if (st === null || !P.isTerminal(st.state)) continue;
-		const h = await harvestTask(dir, st.state, deps);
-		deferredIds.add(a.id);
-		// fresh elapsed (finished_at − created_at) — the admission-time value
-		// is stale by definition (the task ran for the whole wait)
-		const createdAt = adoptedMeta.get(a.id)?.createdAt;
-		deferred.push({
-			id: a.id,
-			agent: a.agent,
-			state: st.state,
-			reason: st.reason,
-			elapsedMs: createdAt !== undefined && st.finished_at !== undefined ? Date.parse(st.finished_at) - Date.parse(createdAt) : a.elapsedMs,
-			result: h.text,
-			partial: h.partial || undefined,
-			overflowFile: h.overflowFile,
-			data: h.data,
-			dataText: h.dataText,
-			overflowDataFile: h.overflowDataFile,
-			sessionId: a.sessionId,
-			adopted: true,
-		});
-	}
-	// deferred harvest (foreign queued): cross-session queued tasks that
-	// went terminal while this call waited
-	for (const f of foreignQueued) {
-		if (deferredIds.has(f.id)) continue;
-		const dir = join(P.tasksRoot(), f.id);
-		const st = await P.readState(dir).catch(() => null);
-		if (st === null || !P.isTerminal(st.state)) continue;
-		const h = await harvestTask(dir, st.state, deps);
-		deferredIds.add(f.id);
-		deferred.push({
-			id: f.id,
-			agent: f.agent,
-			state: st.state,
-			reason: st.reason,
-			elapsedMs: f.createdAt !== undefined && st.finished_at !== undefined ? Date.parse(st.finished_at) - Date.parse(f.createdAt) : 0,
-			result: h.text,
-			partial: h.partial || undefined,
-			overflowFile: h.overflowFile,
-			data: h.data,
-			dataText: h.dataText,
-			overflowDataFile: h.overflowDataFile,
-			sessionId: f.sessionId,
-			adopted: true,
-		});
-	}
-
-	const text = renderReport({ mode: opts.mode, dispatched: results.length, results, queuedThisCall: results.filter((r) => r.queuedThisCall).length, adopted, deferred, aborted });
-	return { mode: opts.mode, dispatched: results.length, results, queuedThisCall: results.filter((r) => r.queuedThisCall).length, adopted, deferred, aborted, text };
+	const text = renderDispatch({ dispatched: results.length, results, aborted });
+	return { mode: opts.mode, dispatched: results.length, results, queued: results.filter((r) => r.queued).length, aborted, text };
 }
 
 // ---------------------------------------------------------------------------
-// the result format (Results — compact; exact wording is an
+// the report (the R1 shape — compact; exact wording is an
 // implementation detail, but the named test pins this shape)
 
-interface RenderReport {
-	mode: "tile" | "headless";
+interface RenderDispatch {
 	dispatched: number;
 	results: DispatchedTaskResult[];
-	queuedThisCall: number;
-	adopted: DispatchedTaskResult[];
-	deferred: DispatchedTaskResult[];
 	aborted: boolean;
 }
 
-const PARTIAL_STATES: ReadonlySet<P.TaskState> = new Set(["killed", "crashed", "timeout", "failed"]);
-
-export function renderReport(r: RenderReport): string {
+/**
+ * The R1 return text: a header line (the non-blocking contract — the
+ * harvests are reported on settlement, not in this result), then one line
+ * per task: short id, agent, state — and, for every non-terminal task, the
+ * one line stating the harvest will be reported on settlement. A task the
+ * pass already settled (a failed spawn) names its state + reason; its
+ * settled harvest is still delivered on settlement like any terminal state.
+ */
+export function renderDispatch(r: RenderDispatch): string {
 	const out: string[] = [];
-	const succeeded = r.results.filter((x) => x.state === "completed").length;
-	// on abort, the still-running tasks are not failures — they keep running
-	// under their wrappers; count them separately
-	const stillRunning = r.aborted ? r.results.filter((x) => !P.isTerminal(x.state)).length : 0;
-	const failed = r.results.length - succeeded - stillRunning;
-	out.push(`${r.dispatched} dispatched · ${succeeded} succeeded, ${failed} failed${stillRunning > 0 ? `, ${stillRunning} still running` : ""}${r.aborted ? " · ABORTED (workers keep running)" : ""}`);
-	if (r.adopted.length > 0) {
-		out.push("");
-		out.push(`running from an earlier call: ${r.adopted.map((a) => `${a.agent} · ${shortId(a.id)}`).join("; ")}`);
-	}
-	out.push("");
+	out.push(
+		`${r.dispatched} dispatched (non-blocking — each task's harvest will be reported on settlement, not in this result)${r.aborted ? " · ABORTED (the spawn pass was skipped — the tasks stay queued under their lease)" : ""}`,
+	);
 	r.results.forEach((res, i) => {
-		const head = `[${i + 1}] ${res.agent} · ${shortId(res.id)} — ${res.state} (${formatElapsed(res.elapsedMs)})${res.reason !== undefined && res.reason !== "" ? ` (${res.reason})` : ""}${PARTIAL_STATES.has(res.state) ? " — partial" : ""}`;
-		out.push(head);
-		const body = res.result !== undefined ? res.result : res.state === "completed" ? "(no result content)" : "(not harvested)";
-		for (const line of body.split("\n")) out.push(line === "" ? "    " : `    ${line}`);
-		// the data block (the typed harvest) — after the answer, before the session line
-		if (res.dataText !== undefined) {
-			res.dataText.split("\n").forEach((line, i) => {
-				out.push(line === "" ? "    " : `    ${i === 0 ? "data: " : ""}${line}`);
-			});
-		}
-		out.push(`    session ${res.sessionId}`);
+		const head = `[${i + 1}] ${res.agent} · ${shortId(res.id)} — ${res.state}${res.reason !== undefined && res.reason !== "" ? ` (${res.reason})` : ""}`;
+		out.push(P.isTerminal(res.state) ? head : `${head} — the harvest will be reported on settlement`);
 	});
-	if (r.deferred.length > 0) {
-		out.push("");
-		out.push(`deferred harvest (terminal since the last call):`);
-		for (const d of r.deferred) {
-			out.push(`  ${d.agent} · ${shortId(d.id)} — ${d.state}${d.partial ? " — partial" : ""}`);
-			if (d.result !== undefined) {
-				for (const line of d.result.split("\n")) out.push(line === "" ? "      " : `      ${line}`);
-			}
-		}
-	}
-	if (r.queuedThisCall > 0) {
-		out.push("");
-		out.push(
-			`${r.queuedThisCall} queued this call, ran after slot freed: ${r.results
-				.filter((x) => x.queuedThisCall)
-				.map((x) => `${x.agent} · ${shortId(x.id)} — ${x.state}`)
-				.join("; ")}`,
-		);
-	}
 	return out.join("\n");
 }

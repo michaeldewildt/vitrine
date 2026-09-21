@@ -1,8 +1,11 @@
 /**
  * hermetic.ts — the hermetic bench driver (impure). Runs the FULL chain —
- * real `dispatchTasks` → real wrapper subprocess (`bun src/vitrine-run.ts`)
- * → the pi shim → fake-pi (`test/fixtures/fake-pi.ts`) → settle → harvest —
- * against a tmp HOME, then the in-process tick sweep
+ * real `dispatchTasks` (the admission + spawn pass) → the factored wait
+ * loop driven in-process (`waitForTasks` — the watcher's mechanism, the
+ * async contract's measurement path, R10) → real wrapper subprocess
+ * (`bun src/vitrine-run.ts`) → the pi shim → fake-pi
+ * (`test/fixtures/fake-pi.ts`) → settle → the collector — against a tmp
+ * HOME, then the in-process tick sweep
  * (`runHeadlessWrapper` with `deps.tickMs` — the only way the sweep can
  * happen, since the production wrapper tick is a hard-coded 1000 ms with no
  * config seam), then the collector over the task dirs, the table via
@@ -23,7 +26,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as P from "../protocol";
 import * as C from "../config";
-import { dispatchTasks, type DispatcherInfo } from "../dispatch";
+import { dispatchTasks, waitForTasks, type DispatcherInfo } from "../dispatch";
 import { runHeadlessWrapper } from "../wrapper/lifecycle";
 import { collectRows, mediansOf, type BenchRow } from "./collector";
 import { fmtMs, renderMedians, renderTable } from "./report";
@@ -125,6 +128,9 @@ export async function runHermetic(opts: HermeticOptions = {}, out: (l: string) =
 	const info: DispatcherInfo = { sessionId: "bench-disp", sessionFile: join(sessionsRoot, "disp.jsonl"), model: "bench/fixture", cwd: base, projectTrusted: false };
 	const bunBin = (): string => BUN_PATH;
 	const deps = { tickMs: PROD_TICK_MS }; // production timing (the dispatcher side; the wrapper subprocess ticks at its production 1000 ms)
+	// the wait loop's lease identity (the driver plays the session's watcher:
+	// it owns the queue from dispatchTasks and refreshes it each tick)
+	const waitLease = { owner: "bench-disp", nonce: "bench-wait" };
 
 	let code = 0;
 	let rowsA: BenchRow[] = [];
@@ -168,8 +174,16 @@ export async function runHermetic(opts: HermeticOptions = {}, out: (l: string) =
 					deps,
 				});
 				const res = r.results[0];
-				if (res !== undefined && res.state === "completed") dirsA.push(join(tasksRoot, res.id));
-				else notesA.push(`run ${i + 1}: state ${res?.state ?? "missing"}${res?.reason !== undefined ? ` (${res.reason})` : ""}`);
+				if (res === undefined) {
+					notesA.push(`run ${i + 1}: no result row`);
+					continue;
+				}
+				// the async contract: the call returned before settlement — wait
+				// in-process (the factored loop) for the terminal state
+				const w = await waitForTasks({ ids: [res.id], mode: "headless", bunBin, lease: waitLease, deps });
+				const ws = w.states[0];
+				if (ws !== undefined && ws.state === "completed") dirsA.push(join(tasksRoot, res.id));
+				else notesA.push(`run ${i + 1}: state ${ws?.state ?? "missing"}${ws?.reason !== undefined ? ` (${ws.reason})` : ""}`);
 			} catch (e) {
 				notesA.push(`run ${i + 1}: ${e instanceof Error ? e.message : String(e)}`);
 			}
@@ -183,7 +197,7 @@ export async function runHermetic(opts: HermeticOptions = {}, out: (l: string) =
 		emit(`medians: ${renderMedians(medians)}`);
 		for (const n of notesA) emit(`note: ${n}`);
 
-		// ---- Battery B: batch admission — one call, 4 tasks, default max_concurrent (2 queue in-call) ----
+		// ---- Battery B: batch admission — one call, 4 tasks, default max_concurrent (2 queue under the pass); the wait loop spawns them as slots free ----
 		const rB = await dispatchTasks({
 			tasks: [1, 2, 3, 4].map((n) => ({ agent: "bench-agent", task: `bench B ${n}` })),
 			mode: "headless",
@@ -191,6 +205,10 @@ export async function runHermetic(opts: HermeticOptions = {}, out: (l: string) =
 			bunBin,
 			deps,
 		});
+		// the async contract: the call returned before settlement — wait
+		// in-process for every task to terminal (the queue's segment is what
+		// the battery measures)
+		await waitForTasks({ ids: rB.results.map((x) => x.id), mode: "headless", bunBin, lease: waitLease, deps });
 		rowsB = await collectRows(rB.results.map((x) => join(tasksRoot, x.id)));
 		emit("");
 		emit(`Battery B — batch admission (4 tasks, cap ${C.readConfigSync().max_concurrent} — the queue segment under load):`);

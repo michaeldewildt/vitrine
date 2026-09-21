@@ -17,6 +17,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionToolContext, ToolResult } from "@earendil-works/pi-coding-agent";
 import * as P from "./protocol";
+import { waitForTasks } from "./dispatch";
 
 // The pi packages resolve only under pi's extension loader (jiti aliases the
 // specifiers), not in this repo — so the extension entry's value imports
@@ -435,6 +436,51 @@ describe("worker mode (exactly one tool)", () => {
 		delete process.env.VITRINE_TASK_DIR;
 	});
 
+	it("a second vitrine_done on a settled task is an idempotent no-op (R12)", async () => {
+		const id = P.newTaskId();
+		const dir = join(tasksRoot, id);
+		const spec: P.TaskSpec = {
+			task_id: id,
+			agent: { name: "test-agent", body: "body\n" },
+			dispatcher_session_id: "disp-ext",
+			cwd: base,
+			session_id: `vitrine.${id}`,
+			session_name: `vitrine: test-agent · ${id.slice(0, 8)}`,
+			mode: "tile",
+			attended: false,
+			workspace: 9,
+			wall_timeout_s: 3600,
+			inactivity_s: 600,
+			auto_settle_s: 600,
+			auto_settle_grace_s: 60,
+			created_at: new Date().toISOString(),
+			boot_id: P.currentBootId(),
+		};
+		await P.createTask(dir, spec, "probe\n");
+		process.env.VITRINE_TASK_DIR = dir;
+		const { api, tools } = fakePi();
+		vitrine(api);
+		const sig = new AbortController().signal;
+		const first = await tools[0].execute!("call1", { answer: "the first answer\n" }, sig, undefined, fakeCtx());
+		expect(first.content[0].text).toContain("Done");
+		const firstMarker = JSON.stringify(await P.readDoneMarker(dir));
+		const firstResult = await readFile(join(dir, "result.md"), "utf8");
+		const eventsBefore = (await P.readEvents(dir)).length;
+		// the second call: the done marker is already written → the handler
+		// short-circuits — no event, no state change, no re-recording (a
+		// confused worker repeating the call gets an acknowledgement, not an
+		// error — and a human-resumed session keeps talking without
+		// re-settling)
+		const second = await tools[0].execute!("call2", { answer: "a different answer\n" }, sig, undefined, fakeCtx());
+		expect(second.content[0].text).toContain("Already settled");
+		expect(second.content[0].text).toContain("no-op");
+		expect((second.details as { noop?: boolean }).noop).toBe(true);
+		expect(JSON.stringify(await P.readDoneMarker(dir))).toBe(firstMarker); // the original marker
+		expect(await readFile(join(dir, "result.md"), "utf8")).toBe(firstResult); // not overwritten
+		expect((await P.readEvents(dir)).length).toBe(eventsBefore); // no event
+		delete process.env.VITRINE_TASK_DIR;
+	});
+
 	it("an invalid VITRINE_TASK_DIR refuses: no tool, stderr line, tail.log line", () => {
 		// a UUID-shaped dir that does not exist
 		process.env.VITRINE_TASK_DIR = join(tasksRoot, P.newTaskId());
@@ -507,18 +553,15 @@ describe("dispatcher mode (cutover + the dispatch tool)", () => {
 		expect(errLines.join("")).toContain("cutover rule");
 	});
 
-	it("E2E (headless): the tool dispatches, waits, harvests, and reports", async () => {
+	it("E2E (headless): the tool returns after the spawn pass — no wait, no harvest; the task settles on disk", async () => {
 		delete process.env.VITRINE_TASK_DIR;
 		// Make the compositor unreachable deterministically (headless
 		// forced): without the instance signature hyprctl exits
-		// non-zero ⇒ the probe reports unreachable ⇒ headless mode. (PATH
-		// tricks are unreliable — a bare `hyprctl` may still resolve via the
-		// glibc default path.)
+		// non-zero ⇒ the probe reports unreachable ⇒ headless mode.
 		const realSig = process.env.HYPRLAND_INSTANCE_SIGNATURE;
 		delete process.env.HYPRLAND_INSTANCE_SIGNATURE;
 		// a fresh, empty tasks root: earlier tests in this file leave `queued`
-		// dirs (no live wrapper) that `countSlots` rightly counts as occupied
-		// slots — an isolated root keeps the E2E from starving behind them.
+		// dirs (no live wrapper) that would count against the cap
 		const realRoot = process.env.VITRINE_TASKS_ROOT;
 		const e2eRoot = join(base, "e2e-tasks");
 		await mkdir(e2eRoot, { recursive: true });
@@ -527,6 +570,7 @@ describe("dispatcher mode (cutover + the dispatch tool)", () => {
 			const { api, tools } = fakePi();
 			vitrine(api);
 			const progress: string[] = [];
+			const started = Date.now();
 			const out = await tools[0].execute!(
 				"call1",
 				{ tasks: [{ agent: "test-agent", task: "say hi" }] },
@@ -534,20 +578,40 @@ describe("dispatcher mode (cutover + the dispatch tool)", () => {
 				(u) => progress.push(u.content.map((c) => c.text).join("\n")),
 				fakeCtx(),
 			);
-			// ToolResult object, not a string (see the vitrine_done regression)
 			const text = out.content.map((c) => c.text).join("\n");
-			expect(text).toContain("1 dispatched · 1 succeeded, 0 failed");
-			expect(text).toContain("completed");
-			expect(progress.length).toBeGreaterThan(0); // onUpdate streamed
-			// the reported task dir is terminal + completed. (Other tests in
-			// this file leave their own dirs, so resolve the specific reported
-			// one via its session handle rather than counting the whole root.)
-			const m = text.match(/session vitrine\.([0-9a-f]{8})/);
+			// The R1 contract: the tool returns after the spawn pass — long
+			// before the worker settles (the fixture takes ~1 s) — and it
+			// carries no harvest and streams no progress
+			expect(Date.now() - started).toBeLessThan(2000);
+			expect(text).toContain("1 dispatched (non-blocking — each task's harvest will be reported on settlement, not in this result)");
+			expect(text).toContain("the harvest will be reported on settlement");
+			expect(progress.length).toBe(0);
+			// the reported task: short id + the state at return time (the
+			// wrapper flips queued→running on its own first tick)
+			const m = text.match(/\[1\] test-agent · ([0-9a-f]{8}) — (running|queued)/);
 			expect(m).not.toBeNull();
 			const dirs = await P.listTaskDirs();
 			const dir = dirs.find((d) => (d.split("/").pop() ?? "").startsWith(m![1]));
 			expect(dir).toBeDefined();
-			expect((await P.readState(dir!)).state).toBe("completed");
+			const taskId = dir!.split("/").pop()!;
+			// drive the wait the way the session's watcher drives it (R2): the
+			// task settles completed on disk (the fixture exits clean like real
+			// pi's --print; the wrapper's settle records the session's last
+			// assistant text as the on-disk harvest — result.md), and no
+			// delivery has happened yet (the watcher — unit 2 — writes the
+			// harvest-delivered marker; the gc-skip keeps the dir until then)
+			const w = await waitForTasks({
+				ids: [taskId],
+				mode: "headless",
+				bunBin: () => process.env.VITRINE_BUN_BIN ?? "bun",
+				lease: { owner: "disp-ext", nonce: "e2e" },
+				deps: { tickMs: 150 },
+			});
+			expect(w.states[0].state).toBe("completed");
+			const onDisk = await readFile(join(dir!, "result.md"), "utf8").catch(() => "");
+			expect(onDisk).toContain("fixture finished the work");
+			expect(text).not.toContain("fixture finished the work"); // the harvest never lands in the tool result
+			expect(await P.harvestDeliveredId(dir!)).toBeNull();
 		} finally {
 			process.env.VITRINE_TASKS_ROOT = realRoot;
 			if (realSig === undefined) delete process.env.HYPRLAND_INSTANCE_SIGNATURE;

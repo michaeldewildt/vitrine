@@ -271,6 +271,13 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<CliRes
 			// a small pid recycled by an unrelated process must not read as "live"
 			if (st.wrapper_pid !== undefined && (await P.wrapperLiveness(dir, st)).live) continue;
 			const spec = await P.readSpec(dir).catch(() => null);
+			// the undelivered async dir: terminal, but its harvest has not been
+			// delivered yet (the session's watcher settles the delivery and
+			// writes the harvest-delivered marker — gc picks the dir up only
+			// once delivered). The `async` spec flag is the upgrade boundary:
+			// historical dirs carry no flag, so the plain retention rule applies
+			// to them as before
+			if (spec?.async === true && (await P.harvestDeliveredId(dir)) === null) continue;
 			const finished = st.finished_at !== undefined ? Date.parse(st.finished_at) : spec?.created_at !== undefined ? Date.parse(spec.created_at) : now();
 			const age = now() - finished;
 			if (age < retentionMs + GC_GRACE_MS) continue;
