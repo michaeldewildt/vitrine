@@ -7,9 +7,12 @@ import { describe, expect, it, beforeAll, afterAll } from "bun:test";
 import { writeFile } from "node:fs/promises";
 import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import * as P from "./protocol";
 import { runCli } from "./cli";
+
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 let base: string;
 let realHome: string;
@@ -363,11 +366,24 @@ describe("list --json", () => {
 });
 
 describe("bench", () => {
-	it("bench live ⇒ exit 2, not yet implemented (the flag surface is reserved)", async () => {
+	it("bench live --mode bogus / --mode (missing value) ⇒ usage, exit 2", async () => {
+		for (const argv of [
+			["bench", "live", "--mode", "bogus"],
+			["bench", "live", "--mode"],
+			["bench", "live", "--runs", "0"],
+		]) {
+			const errs: string[] = [];
+			const r = await runCli(argv, { ...QUIET, err: (l) => errs.push(l) });
+			expect(r.code).toBe(2);
+			expect(errs.join(" ")).toContain("usage: vitrine bench");
+		}
+	});
+
+	it("bench hermetic --mode ⇒ usage (headless-only), exit 2", async () => {
 		const errs: string[] = [];
-		const r = await runCli(["bench", "live"], { ...QUIET, err: (l) => errs.push(l) });
+		const r = await runCli(["bench", "hermetic", "--mode", "headless"], { ...QUIET, err: (l) => errs.push(l) });
 		expect(r.code).toBe(2);
-		expect(errs.join(" ")).toContain("not yet implemented");
+		expect(errs.join(" ")).toContain("headless-only");
 	});
 
 	it("bench without a sub-verb ⇒ usage (stderr), exit 2", async () => {
@@ -400,5 +416,70 @@ describe("bench", () => {
 		expect(Array.isArray(rec.rows)).toBe(true);
 		expect(typeof (rec.medians as Record<string, unknown>).boot_ms).toBe("number");
 		expect(typeof (rec.medians as Record<string, unknown>).settle_ms).toBe("number");
+	}, 120_000);
+});
+
+describe("bench live (the flag surface + the CLI→driver chain against the fixture)", () => {
+	// The CLI runs the REAL driver against the REAL battery (three dispatches,
+	// one at a time) — under the test env (tmp HOME/tasks/sessions) with a
+	// fake-pi shim + the battery's seats, so no real model is touched. The
+	// fixture ignores prompts, so every oracle fails: the run is a
+	// success-0/3 REPORT — and the exit code stays 0 (the contract).
+	let shim: string;
+	let realPiBin: string | undefined;
+	// a fresh scratch tasks root: the earlier tests leave foreign running tasks
+	// (wrapper pid = the test process → live) in the shared root, and those
+	// would hold the slot cap — the driver would queue its tasks behind them
+	// forever. The bench describe runs on a clean root, like the gc --dry-run
+	// and list --json describes do.
+	let root: string;
+
+	beforeAll(async () => {
+		const { chmod, mkdir, writeFile } = await import("node:fs/promises");
+		const agents = join(base, ".pi", "agent", "agents");
+		await mkdir(agents, { recursive: true });
+		await writeFile(
+			join(agents, "explore.md"),
+			"---\nname: explore\ndescription: fixture read-only investigator for the bench live CLI test.\nmodel: ninfer/bench-model\n---\n# Explore\n\nFixture.\n",
+		);
+		await writeFile(
+			join(agents, "execute.md"),
+			"---\nname: execute\ndescription: fixture bounded implementer for the bench live CLI test.\nmodel: ninfer/bench-model\n---\n# Execute\n\nFixture.\n",
+		);
+		shim = join(base, "pi-shim");
+		await writeFile(shim, `#!/bin/sh\nexport VITRINE_FIXTURE_MODE=done\nexport VITRINE_FIXTURE_GAP_MS=30\nexec ${process.execPath} ${REPO_ROOT}/test/fixtures/fake-pi.ts "$@"\n`);
+		await chmod(shim, 0o755);
+		realPiBin = process.env.VITRINE_PI_BIN;
+		process.env.VITRINE_PI_BIN = shim;
+		root = await mkdtemp(join(tmpdir(), "vitrine-cli-benchlive-"));
+		process.env.VITRINE_TASKS_ROOT = root;
+	});
+
+	afterAll(async () => {
+		if (realPiBin === undefined) delete process.env.VITRINE_PI_BIN;
+		else process.env.VITRINE_PI_BIN = realPiBin;
+		process.env.VITRINE_TASKS_ROOT = join(base, "tasks");
+		await rm(root, { recursive: true, force: true });
+	});
+
+	it("bench live --runs 1 --mode headless runs the battery and exits 0 (the failed oracles are a report)", async () => {
+		const r = await runCli(["bench", "live", "--runs", "1", "--mode", "headless"], QUIET);
+		expect(r.code).toBe(0);
+		const text = r.lines.join("\n");
+		expect(text).toContain("vitrine bench live — 1 runs · mode headless · battery: read-ground, bounded-write, decode-proxy");
+		expect(text).toContain("success 0/3"); // the fixture cannot satisfy the real oracles
+		expect(text).toContain("failures (3):");
+		expect(text).toContain("oracle:");
+	}, 120_000);
+
+	it("bench live --json: one line of the live history record, no text report", async () => {
+		const r = await runCli(["bench", "live", "--runs", "1", "--mode", "headless", "--json"], QUIET);
+		expect(r.code).toBe(0);
+		expect(r.lines).toHaveLength(1);
+		const rec = JSON.parse(r.lines[0]) as Record<string, unknown>;
+		expect(rec.suite).toBe("live");
+		expect(rec.params).toEqual({ runs: 1, mode: "headless", battery: ["read-ground", "bounded-write", "decode-proxy"] });
+		expect((rec.rows as unknown[]).length).toBe(3);
+		expect((rec.medians as Record<string, unknown>).e2e_ms).toBe(null); // no successful runs ⇒ null medians
 	}, 120_000);
 });

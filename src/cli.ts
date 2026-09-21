@@ -26,7 +26,15 @@
  *                           state/bench/history.jsonl (gitignored) and
  *                           soft-warns (>20% boot/settle regression vs the
  *                           last prior run on this host — report-only)
- *   vitrine bench live  reserved for the live suite (not yet implemented)
+ *   vitrine bench live [--runs n] [--mode tile|headless] [--json]
+ *                       the live perf suite: the versioned battery
+ *                       (src/bench/battery.ts) against real pi (the real
+ *                       model, the local seats) — the success rate first
+ *                       (the outcome oracles), the latency medians second
+ *                       (over successful runs only); failed runs land in
+ *                       the failures section (a report, not a failure
+ *                       exit); appends the run to
+ *                       state/bench/history.jsonl (suite "live")
  *
  * `runCli` is exported and deps-injected; the entry below just wires it to
  * argv/stdout. Exit codes: 0 ok · 1 failure (bad id, unknown task, kill error)
@@ -88,18 +96,19 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<CliRes
 	const verb = argv[0];
 
 	if (verb === undefined || verb === "help") {
-		emit("usage: vitrine <list [--json] | show <task_id> | kill <task_id> | gc [--dry-run] | bench <hermetic|live> [--runs n] [--json] | help>");
+		emit("usage: vitrine <list [--json] | show <task_id> | kill <task_id> | gc [--dry-run] | bench <hermetic|live> [--runs n] [--mode tile|headless] [--json] | help>");
 		return { code: verb === "help" ? 0 : 2, lines };
 	}
 	if (!(VERBS.includes(verb as (typeof VERBS)[number]) as boolean)) {
 		return fail(`vitrine: unknown verb '${verb}' (expected: ${VERBS.join(", ")})`, 2);
 	}
 
-	// flags: list --json · gc --dry-run · bench <sub> [--runs n] [--json] — any other flag is a usage error
+	// flags: list --json · gc --dry-run · bench <sub> [--runs n] [--mode m] [--json] — any other flag is a usage error
 	let json = false;
 	let dryRun = false;
 	let benchRuns = 5;
-	const benchUsage = "usage: vitrine bench <hermetic|live> [--runs n] [--json]";
+	let benchMode: "tile" | "headless" = "tile";
+	const benchUsage = "usage: vitrine bench <hermetic|live> [--runs n] [--mode tile|headless] [--json]";
 	if (verb === "bench") {
 		const sub = argv[1];
 		if (sub !== "hermetic" && sub !== "live") return fail(`${benchUsage}${sub !== undefined ? ` — unknown sub-verb '${sub}'` : ""}`, 2);
@@ -111,6 +120,12 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<CliRes
 				if (!/^[1-9][0-9]*$/.test(n)) return fail(`${benchUsage} — --runs takes a positive integer`, 2);
 				benchRuns = Number(n);
 				i++;
+			} else if (a === "--mode") {
+				const m = argv[i + 1] ?? "";
+				if (m !== "tile" && m !== "headless") return fail(`${benchUsage} — --mode takes tile or headless`, 2);
+				i++;
+				if (sub === "hermetic") return fail(`${benchUsage} — bench hermetic is headless-only (--mode does not apply)`, 2);
+				benchMode = m;
 			} else if (a.startsWith("--")) return fail(`${benchUsage} — unknown flag '${a}'`, 2);
 			else return fail(`${benchUsage} — unexpected argument '${a}'`, 2);
 		}
@@ -279,8 +294,15 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<CliRes
 
 	// ---- bench -----------------------------------------------------------------
 	if (verb === "bench") {
-		if (argv[1] === "live") return fail("vitrine bench live: not yet implemented (the flag surface is reserved for the live suite)", 2);
-		// the driver is heavy (dispatch + wrapper chain) — load it on demand
+		if (argv[1] === "live") {
+			// the driver is heavy (dispatch + wrapper chain) — load it on demand
+			const { runLive } = await import("./bench/live");
+			// --json: one line of fixed-shape JSON (the history record); the text
+			// report goes to the no-op sink so the JSON line stands alone
+			const r = await runLive({ mode: benchMode, runs: benchRuns }, json ? () => {} : (l) => emit(l));
+			if (json) emit(JSON.stringify(r.record));
+			return { code: r.code, lines };
+		}
 		const { runHermetic } = await import("./bench/hermetic");
 		// --json: one line of fixed-shape JSON (the history record); the text
 		// report goes to the no-op sink so the JSON line stands alone

@@ -28,12 +28,29 @@ export interface BenchProvenance {
 	config: string | null;
 }
 
+/** The bench suites (one history file, both suites — records are suite-stamped). */
+export type BenchSuite = "hermetic" | "live";
+
+export interface HermeticParams {
+	runs: number;
+	gap_ms: number;
+	cost: number;
+	tick_sweep: boolean;
+}
+
+export interface LiveParams {
+	runs: number;
+	mode: "tile" | "headless";
+	/** The battery entry ids (the versioned battery in battery.ts). */
+	battery: string[];
+}
+
 export interface BenchHistoryRecord {
 	ts: string;
-	suite: "hermetic";
+	suite: BenchSuite;
 	hostname: string;
 	provenance: BenchProvenance;
-	params: { runs: number; gap_ms: number; cost: number; tick_sweep: boolean };
+	params: HermeticParams | LiveParams;
 	rows: BenchRow[];
 	medians: Medians;
 }
@@ -61,7 +78,7 @@ export async function readHistory(path: string = historyPath()): Promise<BenchHi
 		if (line.trim() === "") continue;
 		try {
 			const o = JSON.parse(line) as BenchHistoryRecord;
-			if (typeof o.ts === "string" && o.suite === "hermetic") out.push(o);
+			if (typeof o.ts === "string" && (o.suite === "hermetic" || o.suite === "live")) out.push(o);
 		} catch {
 			// skip the malformed line — a corrupt history must not break a run
 		}
@@ -69,11 +86,11 @@ export async function readHistory(path: string = historyPath()): Promise<BenchHi
 	return out;
 }
 
-/** The LAST record before `beforeTs` with the same suite + hostname (the warn-gate baseline). */
-export function lastPriorFor(records: BenchHistoryRecord[], hostname: string, beforeTs: string): BenchHistoryRecord | null {
+/** The LAST record before `beforeTs` with the same suite + hostname (the baseline comparison). */
+export function lastPriorFor(records: BenchHistoryRecord[], hostname: string, beforeTs: string, suite: BenchSuite = "hermetic"): BenchHistoryRecord | null {
 	let last: BenchHistoryRecord | null = null;
 	for (const r of records) {
-		if (r.suite === "hermetic" && r.hostname === hostname && r.ts < beforeTs) last = r;
+		if (r.suite === suite && r.hostname === hostname && r.ts < beforeTs) last = r;
 	}
 	return last;
 }

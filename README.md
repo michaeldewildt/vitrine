@@ -75,13 +75,15 @@ src/cli.ts                            the `vitrine` CLI — bin entry (shebang)
 src/bench/                            the perf-eval core — the pure collector
   (one task dir → one metrics row) · report.ts (rows → table/JSON, no IO) ·
   history.ts (state/bench/history.jsonl, gitignored) · hermetic.ts (the
-  headless driver behind `vitrine bench hermetic`)
+  headless driver behind `vitrine bench hermetic`) · battery.ts (the
+  versioned live battery + the pure outcome oracles) · live.ts (the live
+  driver behind `vitrine bench live` — the real model, the local seats)
 test/helpers.ts, test/fixtures/fake-pi.ts    shared test base + the fixture pi binary
 agents/                                       the shipped worker agent files
 docs/example-agent.md                         the copyable agent template
 ```
 
-Data flow, one way around: `vitrine_dispatch` (the model's tool) → `dispatchTasks` reconciles, admits against the liveness-qualified slot cap, creates the task dir (`spec.json` + `prompt.txt`, `0700`/`0600`), spawns (tile: hyprctl argv → a foot tile running `vitrine-run`; headless: a detached `vitrine-run`), polls, harvests, reports. The wrapper (`vitrine-run` → `runWrapper`/`runHeadlessWrapper`) does the `queued→running` CAS, spawns the worker `pi` session, and runs the watchdog loop until `done.marker` / kill / timeout — `state.json` is the status record of record (monotonic, single-writer per regime), `events.jsonl` the audit log. The worker's `vitrine_done` tool writes `result.md` + `done.marker` and never `state.json`. The `vitrine` CLI reads the same task dirs (list/show/kill/gc) and runs the perf-eval suite over them (`bench hermetic` — the hermetic driver in `src/bench/`; `bench live` is reserved). No daemon, no socket — `spec.json` is the only parent→worker transport.
+Data flow, one way around: `vitrine_dispatch` (the model's tool) → `dispatchTasks` reconciles, admits against the liveness-qualified slot cap, creates the task dir (`spec.json` + `prompt.txt`, `0700`/`0600`), spawns (tile: hyprctl argv → a foot tile running `vitrine-run`; headless: a detached `vitrine-run`), polls, harvests, reports. The wrapper (`vitrine-run` → `runWrapper`/`runHeadlessWrapper`) does the `queued→running` CAS, spawns the worker `pi` session, and runs the watchdog loop until `done.marker` / kill / timeout — `state.json` is the status record of record (monotonic, single-writer per regime), `events.jsonl` the audit log. The worker's `vitrine_done` tool writes `result.md` + `done.marker` and never `state.json`. The `vitrine` CLI reads the same task dirs (list/show/kill/gc) and runs the perf-eval suite over them (`bench hermetic` — the hermetic driver in `src/bench/`; `bench live` — the versioned battery in `src/bench/battery.ts` against real pi, success rate first via the outcome oracles, latency medians second). No daemon, no socket — `spec.json` is the only parent→worker transport.
 
 ## Quickstart
 
