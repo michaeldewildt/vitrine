@@ -120,14 +120,18 @@ interface RegisteredTool {
 
 function fakePi(activeTools: string[] = [], opts: { coOwner?: boolean } = {}) {
 	const tools: RegisteredTool[] = [];
-	const sessionStart: Array<() => void> = [];
+	const sessionStart: Array<(event: unknown, ctx: unknown) => unknown> = [];
+	const sessionShutdown: Array<(event: unknown, ctx: unknown) => unknown> = [];
+	/** The captured `sendMessage` calls (the fake pi's delivery surface — R3). */
+	const sentMessages: Array<{ message: unknown; options?: unknown }> = [];
 	const setActiveToolsCalls: string[][] = [];
 	const api: ExtensionAPI = {
 		registerTool: (def) => {
 			tools.push(def as RegisteredTool);
 		},
-		on: (event: string, handler: () => void) => {
+		on: (event: string, handler: (...a: unknown[]) => unknown) => {
 			if (event === "session_start") sessionStart.push(handler);
+			else if (event === "session_shutdown") sessionShutdown.push(handler);
 		},
 		getActiveTools: () => activeTools,
 		getAllTools: () =>
@@ -144,14 +148,26 @@ function fakePi(activeTools: string[] = [], opts: { coOwner?: boolean } = {}) {
 			setActiveToolsCalls.push(names);
 		},
 		getSessionName: () => "test",
+		// The delivery surface (R3): captured, never fails (a failed send is
+		// the watcher core's business — src/watcher.test.ts drives it there)
+		sendMessage: (message: unknown, options?: unknown) => {
+			sentMessages.push({ message, options });
+			return Promise.resolve();
+		},
 	} as ExtensionAPI;
 	return {
 		api,
 		tools,
 		setActiveToolsCalls,
+		sentMessages,
 		// test seam: fire the session_start handlers (pi does this after load)
-		fire: () => {
-			for (const h of sessionStart) h();
+		// with the (event, ctx) pair pi hands them
+		fire: (event: unknown = { reason: "startup" }, ctx: unknown = fakeCtx()) => {
+			for (const h of sessionStart) h(event, ctx);
+		},
+		// test seam: fire the session_shutdown handlers (the watcher's close)
+		fireShutdown: () => {
+			for (const h of sessionShutdown) h({ reason: "shutdown" }, fakeCtx());
 		},
 	};
 }
@@ -567,7 +583,8 @@ describe("dispatcher mode (cutover + the dispatch tool)", () => {
 		await mkdir(e2eRoot, { recursive: true });
 		process.env.VITRINE_TASKS_ROOT = e2eRoot;
 		try {
-			const { api, tools } = fakePi();
+			const fake = fakePi();
+			const { api, tools } = fake;
 			vitrine(api);
 			const progress: string[] = [];
 			const started = Date.now();
@@ -597,9 +614,8 @@ describe("dispatcher mode (cutover + the dispatch tool)", () => {
 			// drive the wait the way the session's watcher drives it (R2): the
 			// task settles completed on disk (the fixture exits clean like real
 			// pi's --print; the wrapper's settle records the session's last
-			// assistant text as the on-disk harvest — result.md), and no
-			// delivery has happened yet (the watcher — unit 2 — writes the
-			// harvest-delivered marker; the gc-skip keeps the dir until then)
+			// assistant text as the on-disk harvest — result.md). The tool
+			// result carries no harvest — the harvest arrives as the delivery.
 			const w = await waitForTasks({
 				ids: [taskId],
 				mode: "headless",
@@ -611,11 +627,83 @@ describe("dispatcher mode (cutover + the dispatch tool)", () => {
 			const onDisk = await readFile(join(dir!, "result.md"), "utf8").catch(() => "");
 			expect(onDisk).toContain("fixture finished the work");
 			expect(text).not.toContain("fixture finished the work"); // the harvest never lands in the tool result
-			expect(await P.harvestDeliveredId(dir!)).toBeNull();
+			// The session's watcher — armed by the dispatch call itself —
+			// delivers the harvest on settlement: the async contract's E2E (the
+			// delivery, not the tool result, carries the harvest; the
+			// harvest-delivered marker lands after the successful send)
+			const findHarvest = () =>
+				fake.sentMessages.find(
+					(m) => typeof (m.message as { content?: string }).content === "string" && (m.message as { content: string }).content.includes("fixture finished the work"),
+				);
+			const deadline = Date.now() + 8000;
+			while (Date.now() < deadline && !findHarvest()) await new Promise((r) => setTimeout(r, 100));
+			const harvest = findHarvest();
+			expect(harvest).toBeDefined(); // the delivery landed
+			const harvestMsg = harvest!.message as { customType: string; details: { batch: string } };
+			expect(harvestMsg.customType).toBe("vitrine-harvest");
+			expect(harvest!.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
+			expect(await P.harvestDeliveredId(dir!)).toBe(harvestMsg.details.batch); // the marker is written after the send
 		} finally {
 			process.env.VITRINE_TASKS_ROOT = realRoot;
 			if (realSig === undefined) delete process.env.HYPRLAND_INSTANCE_SIGNATURE;
 			else process.env.HYPRLAND_INSTANCE_SIGNATURE = realSig;
+		}
+	}, 30_000);
+
+	it("E2E (wiring): session_start arms the watcher — a settled async task delivers via pi.sendMessage; session_shutdown closes it", async () => {
+		delete process.env.VITRINE_TASK_DIR;
+		// a fresh, empty tasks root: the shared root carries earlier tests' dirs
+		const realRoot = process.env.VITRINE_TASKS_ROOT;
+		const wireRoot = join(base, "wire-tasks");
+		await mkdir(wireRoot, { recursive: true });
+		process.env.VITRINE_TASKS_ROOT = wireRoot;
+		try {
+			const fake = fakePi();
+			vitrine(fake.api);
+			// a completed async task for this session (the fake ctx's session id),
+			// undelivered — the session-start arm must REPLAY it (R5)
+			const id = P.newTaskId();
+			const dir = join(wireRoot, id);
+			const spec: P.TaskSpec = {
+				task_id: id,
+				agent: { name: "test-agent", body: "body\n" },
+				dispatcher_session_id: "disp-ext",
+				cwd: base,
+				session_id: `vitrine.${id}`,
+				session_name: `vitrine: test-agent · ${id.slice(0, 8)}`,
+				mode: "headless",
+				attended: false,
+				workspace: 9,
+				wall_timeout_s: 3600,
+				inactivity_s: 600,
+				auto_settle_s: 600,
+				auto_settle_grace_s: 60,
+				async: true,
+				created_at: new Date().toISOString(),
+				boot_id: P.currentBootId(),
+			};
+			await P.createTask(dir, spec, "wiring prompt\n");
+			await P.transitionState(dir, "queued", "running", { started_at: new Date(Date.now() - 42_000).toISOString() });
+			await writeFile(join(dir, "result.md"), "the wiring answer\n");
+			await P.transitionState(dir, "running", "completed", { finished_at: new Date().toISOString() });
+			// session start → the watcher arms (the session-start scope: attach + replay)
+			fake.fire();
+			// the production tick is 1000 ms — the replay delivery lands well inside
+			// the wait (the first loop pass runs before the first tick sleep)
+			await new Promise((r) => setTimeout(r, 2500));
+			expect(fake.sentMessages).toHaveLength(1);
+			const { message, options } = fake.sentMessages[0] as { message: { customType: string; content: string }; options: Record<string, unknown> };
+			expect(message.customType).toBe("vitrine-harvest");
+			expect(message.content).toContain("the wiring answer");
+			expect(message.content).toContain("replay: the session restarted"); // undelivered at session start
+			expect(options).toEqual({ deliverAs: "followUp", triggerTurn: true });
+			expect(await P.harvestDeliveredId(dir)).toBeTruthy(); // the marker is written after the send
+			// session shutdown → the watcher closes (no send after it)
+			fake.fireShutdown();
+			await new Promise((r) => setTimeout(r, 1200));
+			expect(fake.sentMessages).toHaveLength(1);
+		} finally {
+			process.env.VITRINE_TASKS_ROOT = realRoot;
 		}
 	}, 30_000);
 });

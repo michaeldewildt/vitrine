@@ -8,19 +8,25 @@
  * the session-scoped watcher (the delivery side) and the bench drivers
  * (R10) drive.
  *
- * Per tick: reconcile (the in-scope unspawned queue is excluded — it is
- * what this loop is about to spawn, never "stuck") → refresh the in-scope
- * unspawned tasks' owner lease (freshness is what makes them a live queue,
- * not a dead owner's residue) → count the liveness-qualified slots →
- * spawn in-scope queued tasks as slots free → poll the in-scope states.
- * Stops when every in-scope task is terminal or the stop signal flips —
- * NOTHING settles on abort (delivery is session-scoped, not turn-scoped:
- * the queue's lease decides its fate — a live owner keeps ticking it, a
- * dead owner's stale lease settles it never-spawned).
+ * Per tick: attach the provider scope's new ids (a dynamic `ids` grows the
+ * owned set mid-wait — the watcher's dispatches land while it runs) →
+ * reconcile (the in-scope unspawned queue is excluded — it is what this
+ * loop is about to spawn, never "stuck") → refresh the in-scope unspawned
+ * tasks' owner lease (freshness is what makes them a live queue, not a
+ * dead owner's residue) → count the liveness-qualified slots → spawn
+ * in-scope queued tasks as slots free (per-task spec.mode — a mixed-mode
+ * scope spawns each task the way its own dispatch planned it) → poll the
+ * in-scope states → the `onPass` hook (the watcher's per-tick delivery
+ * check, R3).
+ * Stops when every owned task is terminal AND the `pending` condition (the
+ * R2 stop condition's delivery clause) is not true, or the stop signal
+ * flips — NOTHING settles on abort (delivery is session-scoped, not
+ * turn-scoped: the queue's lease decides its fate — a live owner keeps
+ * ticking it, a dead owner's stale lease settles it never-spawned).
  *
- * The loop does NOT harvest: it returns the observed states; the caller
- * owns the harvest (the watcher's delivery via `harvestTask`; the bench
- * collector reads the task dirs).
+ * The loop does NOT harvest: it hands the observed states to `onPass` and
+ * returns them; the caller owns the harvest (the watcher's delivery via
+ * `harvestTask`; the bench collector reads the task dirs).
  */
 import { join } from "node:path";
 import * as P from "../protocol";
@@ -31,9 +37,15 @@ import { issueSpawn, type SpawnEnv } from "./spawn";
 import type { DispatchDeps } from "./core";
 
 export interface WaitOptions {
-	/** The task ids this wait owns: the queued ones spawn as slots free; every one is polled to terminal. */
-	ids: string[];
-	/** The spawn shape (the compositor probe's decision, as in the entry). */
+	/**
+	 * The task ids this wait owns (a static set) — or a PROVIDER re-evaluated
+	 * each tick: new ids join the owned set (the session-scoped watcher's
+	 * scope — a dispatch that lands mid-wait is owned from the next tick,
+	 * R2). The queued ones spawn as slots free; every one is polled to
+	 * terminal.
+	 */
+	ids: string[] | (() => string[] | Promise<string[]>);
+	/** The spawn shape (the compositor probe's decision, as in the entry; the per-task spec.mode wins for the actual spawn). */
 	mode: "tile" | "headless";
 	/** The dispatcher's own bun binary (a thunk; headless only — tile never resolves it). */
 	bunBin: () => string;
@@ -41,6 +53,31 @@ export interface WaitOptions {
 	lease: { owner: string; nonce: string };
 	/** The injectable deps (the entry's `DispatchDeps` shape — the loop's timing + the spawn transport). */
 	deps?: DispatchDeps;
+	/**
+	 * Called after each state-poll pass, with every owned task's
+	 * last-observed state — the session-scoped watcher's per-tick delivery
+	 * hook (R3): a settlement visible in this pass is delivered in this
+	 * tick. Awaiting it is part of the tick (before the stop check, before
+	 * the sleep).
+	 */
+	onPass?: (tasks: PassTask[]) => Promise<void> | void;
+	/**
+	 * The external pending condition — the R2 stop condition's delivery
+	 * clause: the loop stays alive (even with every owned task terminal) as
+	 * long as this returns true (an undelivered settlement still due for a
+	 * send, a failed send still inside its retry budget).
+	 */
+	pending?: () => boolean;
+}
+
+/** One owned task's last-observed state, as handed to `WaitOptions.onPass`. */
+export interface PassTask {
+	id: string;
+	dir: string;
+	spec: P.TaskSpec;
+	/** The last-observed state (the attach read, or the latest poll). */
+	state: P.TaskState;
+	reason?: string;
 }
 
 export interface WaitedTaskState {
@@ -115,17 +152,25 @@ export async function waitForTasks(opts: WaitOptions): Promise<WaitResult> {
 		seenReason?: string;
 	}
 	const owned: Owned[] = [];
-	for (const id of opts.ids) {
+	const ownedIds = new Set<string>();
+	const attach = async (id: string): Promise<void> => {
+		if (ownedIds.has(id)) return;
 		const dir = join(P.tasksRoot(), id);
 		const st = await P.readState(dir).catch(() => null);
-		if (st === null) continue;
+		if (st === null) return;
 		const spec = await P.readSpec(dir).catch(() => null);
-		if (spec === null) continue;
+		if (spec === null) return;
 		// a spawn in flight: the state already left `queued` (the wrapper
 		// flipped it), or the spawn-issued event is fresh (the caller's pass
 		// issued it within the wrapper's boot window) — never re-spawn it
 		owned.push({ id, dir, spec, spawnIssued: st.state !== "queued" || (await spawnInFlight(dir)), spawned: false, seenState: st.state, seenReason: st.reason });
-	}
+		ownedIds.add(id);
+	};
+	// a static set and a provider share the attach path — the provider is
+	// re-evaluated every tick (the scope can grow mid-wait)
+	const idsOpt = opts.ids;
+	const idProvider: () => string[] | Promise<string[]> = typeof idsOpt === "function" ? idsOpt : () => idsOpt;
+	for (const id of await idProvider()) await attach(id);
 
 	let aborted = false;
 	while (true) {
@@ -133,6 +178,11 @@ export async function waitForTasks(opts: WaitOptions): Promise<WaitResult> {
 			aborted = true;
 			break;
 		}
+		// A provider scope grows mid-wait (the session's watcher: a dispatch
+		// that lands this tick is owned from this pass) — attach the new ids
+		// before the pass so they take part in it (reconcile-exclusion, lease
+		// refresh, admission).
+		for (const id of await idProvider()) await attach(id);
 		// Per-tick order: reconcile → count → spawn. The loop's own
 		// unspawned tasks are the in-scope queue — excluded from the slot
 		// count (they become holders once their spawn is issued) and from
@@ -163,7 +213,9 @@ export async function waitForTasks(opts: WaitOptions): Promise<WaitResult> {
 			const live = await P.wrapperLiveness(o.dir, st);
 			if (live.live) continue;
 			if (await spawnInFlight(o.dir)) continue;
-			await issueSpawn({ id: o.id, dir: o.dir, agentName: o.spec.agent.name, spec: o.spec }, env);
+			// the per-task spawn shape (spec.mode — the task's own dispatch
+			// planned it; a mixed-mode scope spawns each task its own way)
+			await issueSpawn({ id: o.id, dir: o.dir, agentName: o.spec.agent.name, spec: o.spec }, { ...env, mode: o.spec.mode });
 			// the spawn either issued (the state is running or will be; the
 			// wrapper flips queued→running on its own tick) or settled
 			// failed-to-spawn — re-observe either way
@@ -193,7 +245,16 @@ export async function waitForTasks(opts: WaitOptions): Promise<WaitResult> {
 			o.seenReason = st.reason;
 			if (!P.isTerminal(st.state)) allTerminal = false;
 		}
-		if (allTerminal) break;
+		// The per-tick delivery hook (R3): the pass's observed states, before
+		// the stop check — a settlement visible in this pass is delivered in
+		// this tick (the watcher's onPass: coalesced edge-triggered send).
+		if (opts.onPass !== undefined && owned.length > 0) {
+			await opts.onPass(owned.map((o) => ({ id: o.id, dir: o.dir, spec: o.spec, state: o.seenState, reason: o.seenReason })));
+		}
+		// Stop: every owned task is terminal AND nothing is pending outside the
+		// loop (the delivery clause — a failed or still-due send keeps the loop
+		// alive, R2).
+		if (allTerminal && !(opts.pending?.() ?? false)) break;
 		await sleep(tickMs);
 	}
 

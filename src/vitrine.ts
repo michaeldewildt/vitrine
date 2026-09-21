@@ -29,6 +29,7 @@ import { Type } from "typebox";
 import { Compile } from "typebox/compile";
 import * as P from "./protocol";
 import * as D from "./dispatch";
+import { startSessionWatcher, type DeliveryOptions, type HarvestMessage, type SessionWatcher } from "./watcher";
 import { listAgentSummaries } from "./agents";
 import { makeDoneRenderers, type DoneRenderDeps } from "./done-render";
 
@@ -330,6 +331,12 @@ export default function vitrine(pi: ExtensionAPI): void {
 					signal,
 				},
 			});
+			// The queue is owned by the session's watcher from this pass (R2):
+			// re-arm it when it had stopped (the stop condition applied after the
+			// previous work drained) — the dispatch guarantees its own batch is
+			// watched. No replay here: the context is live (a re-show would be a
+			// genuine duplicate, not a replay).
+			armWatcher(dispatcher.sessionId, false);
 			// A plain-string result crashes pi's TUI and is dropped from the
 			// session record — return the ToolResult object (verified 2026-09-17).
 			return { content: [{ type: "text", text: report.text }], details: { mode, results: report.results } };
@@ -346,7 +353,34 @@ export default function vitrine(pi: ExtensionAPI): void {
 	// before us was superseded by us and is undetectable (we own the name
 	// then — documented limitation). On a detected conflict we deactivate
 	// ours (a registration cannot be retracted) and warn.
-	pi.on("session_start", () => {
+
+	// ---- The session-scoped watcher (R2/R3) ---------------------------------
+	// The session's long-lived poller: it owns what the blocking call used to
+	// own (admitting queued tasks as slots free, spawning them, refreshing
+	// their owner lease each tick) and the delivery (every in-scope task that
+	// settled since the last delivery goes out coalesced as one
+	// pi.sendMessage, R3). It arms at session_start (the session-start scope
+	// is the GLOBAL predicate set — attach + replay, R5), re-arms at every
+	// dispatch call (a stopped watcher is re-armed by the tool — the queue is
+	// owned from the pass onward), and closes at session_shutdown (nothing
+	// settles on close).
+	let watcher: SessionWatcher | null = null;
+	const sendHarvest: (message: HarvestMessage, options: DeliveryOptions) => Promise<void> = (message, options) => {
+		// The floor check (R8) made sendMessage part of the declared surface —
+		// the runtime guard is for a genuinely older pi than the stubs assume.
+		const fn = (pi as unknown as { sendMessage?: (message: unknown, options?: unknown) => Promise<void> }).sendMessage;
+		if (typeof fn !== "function") {
+			throw new Error("pi.sendMessage is unavailable — the vitrine pi floor (0.85) is not met");
+		}
+		return fn.call(pi, message, options);
+	};
+	const armWatcher = (sessionId: string, replay: boolean): void => {
+		if (watcher !== null && watcher.closed) watcher = null;
+		if (watcher !== null && !watcher.stopped) return; // already watching
+		watcher = startSessionWatcher({ sessionId, send: sendHarvest, replay, bunBin: D.resolveBunBin });
+	};
+
+	const onSessionStart = (_event: unknown, ctx: unknown): void => {
 		try {
 			const entry = pi.getAllTools().find((t) => t.name === DISPATCH_TOOL);
 			const ownPath = safeRealpath(fileURLToPath(import.meta.url));
@@ -361,6 +395,27 @@ export default function vitrine(pi: ExtensionAPI): void {
 			// best-effort: a future pi without session-time introspection — a
 			// duplicate, if any, is still pi's own to surface
 		}
+		// The session-start arm (R5): the scope is the GLOBAL predicate set —
+		// non-terminal async tasks are re-attached (their queue settles into
+		// this session) and terminal undelivered non-attended tasks are
+		// replayed (one coalesced message, the `replay:` header). The reason
+		// (startup/resume/fork) only changes what the model already knows —
+		// the replay predicate is global in every case.
+		const sm = (ctx as { sessionManager?: { getSessionId(): string } } | null | undefined)?.sessionManager;
+		if (typeof sm?.getSessionId === "function") {
+			const sessionId = sm.getSessionId();
+			watcher?.close(); // a previous arm in this process (defensive — pi re-binds extensions per session)
+			watcher = null;
+			armWatcher(sessionId, true);
+		}
+	};
+	pi.on("session_start", onSessionStart);
+	pi.on("session_shutdown", () => {
+		// Close the watcher: the loop exits; nothing settles on close (the
+		// queue's lease decides its fate — a dead owner's stale lease settles
+		// it never-spawned on the next reconcile).
+		watcher?.close();
+		watcher = null;
 	});
 }
 
