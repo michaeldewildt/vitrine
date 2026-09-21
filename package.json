@@ -1,0 +1,30 @@
+{
+  "name": "vitrine",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "OS-native dispatch for specialist AI agents: every task a visible Hyprland/foot tile, state on disk.",
+  "keywords": ["pi-package"],
+  "bin": {
+    "vitrine": "src/cli.ts",
+    "vitrine-run": "src/vitrine-run.ts"
+  },
+  "pi": {
+    "extensions": [
+      "./src/vitrine.ts"
+    ]
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "@types/node": "^22.20.3",
+    "typebox": "^1.1.38",
+    "typescript": "^7.0.2"
+  }
+}
