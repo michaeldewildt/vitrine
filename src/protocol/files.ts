@@ -126,6 +126,15 @@ export async function readDoneMarker(dir: string): Promise<DoneMarker | null> {
 // lease.json (owner claim — the stuck-queued gate)
 
 /**
+ * The lease-freshness window: a lease younger than this is a live owner
+ * (someone is still ticking the queue). The stuck-queued settle and the
+ * slot count both key on this — a queue is live while its owner refreshes,
+ * whatever its creation age (a queue behind a slow worker is minutes long,
+ * not 15 s).
+ */
+export const LEASE_TTL_MS = 30_000;
+
+/**
  * The owner's claim on a queued task: written by the dispatch call that
  * created the task, and refreshed on every tick of that call's wait loop.
  * A live owner always leaves a fresh lease behind; a dead one (crash,

@@ -51,6 +51,14 @@ export interface TaskSpec {
 	from_task_id?: string;
 	/** Raw session file to fork — `context` tasks fork the dispatcher's own live session file, which lives in no task dir. Mutually exclusive with `from_task_id`. */
 	from_session_file?: string;
+	/**
+	 * The delivery-eligibility marker (the upgrade boundary): written `true`
+	 * on every task created from the async-dispatch change onward. Absent on
+	 * historical (blocking-era) task dirs — their absence is the clean upgrade
+	 * boundary: historical tasks are excluded from delivery, replay, and the
+	 * gc-skip by the absence of this field.
+	 */
+	async?: boolean;
 	created_at: string;
 	boot_id: string;
 }
@@ -94,6 +102,7 @@ const SPEC_FIELDS: FieldDef[] = [
 	{ key: "output_schema", msg: "output_schema must be a plain object (a JSON Schema)", pred: plainObject, optional: true },
 	{ key: "from_task_id", msg: "from_task_id must be a lowercase uuidv4", pred: uuid, optional: true },
 	{ key: "from_session_file", msg: "from_session_file must be a non-empty string", pred: nonEmpty, optional: true },
+	{ key: "async", msg: "async must be a boolean (the delivery-eligibility marker)", pred: (v) => typeof v === "boolean", optional: true },
 	{ key: "created_at", msg: "created_at must be an ISO timestamp", pred: isoTs },
 	{ key: "boot_id", msg: "boot_id is required", pred: nonEmpty },
 ];

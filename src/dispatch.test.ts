@@ -1130,26 +1130,28 @@ describe("abort semantics", () => {
 });
 
 describe("countSlots (liveness-qualified)", () => {
-	it("counts live running wrappers, young queued, and nothing else", () => {
+	it("counts live running wrappers, fresh-lease queued, and nothing else (the lease is the key)", () => {
 		const proc = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
 		proc.unref();
 		const live = P.pidInfo(proc.pid!);
 		const now = Date.now();
-		const young = new Date().toISOString();
-		const old = new Date(now - 60_000).toISOString();
+		const freshLease = new Date(now - 1_000).toISOString(); // the owner ticked 1 s ago
+		const staleLease = new Date(now - 45_000).toISOString(); // the owner stopped ticking
 		const n = countSlots(
 			[
 				{ dir: "/a", state: "running", wrapperPid: proc.pid, wrapperPidStart: live.startTime },
 				{ dir: "/b", state: "running", wrapperPid: proc.pid, wrapperPidStart: "recycled-start-time" },
 				{ dir: "/c", state: "running" },
 				{ dir: "/d", state: "queued", wrapperPid: proc.pid },
-				{ dir: "/e", state: "queued", createdAt: young },
-				{ dir: "/f", state: "queued", createdAt: old },
-				{ dir: "/g", state: "completed" },
+				{ dir: "/e", state: "queued", leaseUpdatedAt: freshLease },
+				{ dir: "/f", state: "queued", leaseUpdatedAt: staleLease },
+				{ dir: "/g", state: "queued", leaseUpdatedAt: null }, // no lease — a dead owner's residue
+				{ dir: "/h", state: "completed" },
 			],
 			now,
 		);
-		// a (live+start-match) + d (live wrapper) + e (young) = 3
+		// a (live+start-match) + d (live wrapper) + e (fresh lease — a live queue,
+		// whatever its creation age) = 3
 		expect(n).toBe(3);
 		process.kill(proc.pid!, "SIGTERM");
 	});

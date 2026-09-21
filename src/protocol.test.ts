@@ -227,10 +227,10 @@ describe("createTask and spec round-trip", () => {
 		expect(await P.readSpec(join(root, id))).toEqual(spec);
 	});
 
-	it("round-trips the full field set (headless, attended, max_cost_usd, from_task_id, output_schema)", async () => {
+	it("round-trips the full field set (headless, attended, max_cost_usd, from_task_id, output_schema, async)", async () => {
 		const id = P.newTaskId();
 		const outputSchema = { type: "object", properties: { verdict: { type: "string" } }, required: ["verdict"] };
-		const spec = { ...makeSpec(id), mode: "headless" as const, attended: true, max_cost_usd: 1.5, from_task_id: P.newTaskId(), output_schema: outputSchema };
+		const spec = { ...makeSpec(id), mode: "headless" as const, attended: true, max_cost_usd: 1.5, from_task_id: P.newTaskId(), output_schema: outputSchema, async: true };
 		await P.createTask(join(root, id), spec, PROMPT.replace("<id>", id));
 		expect(await P.readSpec(join(root, id))).toEqual(spec);
 	});
@@ -256,6 +256,7 @@ describe("createTask and spec round-trip", () => {
 			["output_schema null", (s) => (s.output_schema = null)],
 			["from_task_id not uuid", (s) => (s.from_task_id = "abc")],
 			["boot_id missing", (s) => delete s.boot_id],
+			["async not boolean", (s) => (s.async = "yes")],
 			["agent.tools not strings", (s) => (s.agent = { name: "r", tools: [1] })],
 			["empty agent name", (s) => (s.agent = { name: "" })],
 			["empty session_id", (s) => (s.session_id = "")],
@@ -571,6 +572,44 @@ describe("session.json, result.md, kill_requested, events, tail", () => {
 });
 
 // ---------------------------------------------------------------------------
+// harvest-delivered (the delivery marker — absence = undelivered)
+
+describe("harvest-delivered (the delivery marker)", () => {
+	it("writes one event carrying the delivery-batch id; the reader returns it", async () => {
+		const { dir } = await newTask();
+		expect(await P.harvestDeliveredId(dir)).toBeNull(); // absence = undelivered
+		expect(await P.writeHarvestDelivered(dir, "batch-1")).toBe(true);
+		expect(await P.harvestDeliveredId(dir)).toBe("batch-1");
+		const evs = await P.readEvents(dir);
+		expect(evs.filter((e) => e.event === "harvest-delivered")).toEqual([{ ts: expect.any(String), event: "harvest-delivered", id: "batch-1" }]);
+	});
+
+	it("is write-once: a second write is a no-op (the first batch id stands)", async () => {
+		const { dir } = await newTask();
+		expect(await P.writeHarvestDelivered(dir, "batch-1")).toBe(true);
+		expect(await P.writeHarvestDelivered(dir, "batch-2")).toBe(false);
+		expect(await P.harvestDeliveredId(dir)).toBe("batch-1");
+		const evs = await P.readEvents(dir);
+		expect(evs.filter((e) => e.event === "harvest-delivered").length).toBe(1);
+	});
+
+	it("two tasks delivered in one message share the batch id (membership reconstructable from disk)", async () => {
+		const a = await newTask();
+		const b = await newTask();
+		await P.writeHarvestDelivered(a.dir, "batch-x");
+		await P.writeHarvestDelivered(b.dir, "batch-x");
+		expect(await P.harvestDeliveredId(a.dir)).toBe("batch-x");
+		expect(await P.harvestDeliveredId(b.dir)).toBe("batch-x");
+	});
+
+	it("a historical task dir (no marker) reads undelivered", async () => {
+		const { dir } = await newTask();
+		await P.appendEvent(dir, { event: "watchdog", kind: "wall", budget: 3600 });
+		expect(await P.harvestDeliveredId(dir)).toBeNull();
+	});
+});
+
+// ---------------------------------------------------------------------------
 // environment facts & hygiene
 
 describe("environment facts and hygiene", () => {
@@ -737,6 +776,26 @@ describe("reconcileStuckQueued", () => {
 		expect(r.settled).toBe("crashed");
 		expect(r.state).toBe("crashed");
 		expect(r.reason).toBe("never-spawned");
+	});
+
+	it("a minutes-old queue with a tick-refreshed lease survives past the window (the lease is the key, not creation age)", async () => {
+		// the async-dispatch case: a task created 60 s ago, still queued behind
+		// a slow worker, with the owner (the dispatch call / the session watcher)
+		// refreshing the lease every tick — the 15 s stuck window is a grace on
+		// creation age, not on lease freshness
+		const id = P.newTaskId();
+		const dir = join(root, id);
+		await P.createTask(dir, makeSpec(id), PROMPT);
+		const spec = await P.readSpec(dir);
+		const created = Date.parse(spec.created_at) - 60_000; // backdate the creation
+		spec.created_at = new Date(created).toISOString();
+		await writeFile(join(dir, "spec.json"), JSON.stringify(spec, null, 2));
+		const now = created + 60_000;
+		await P.writeLease(dir, { owner: "sess", nonce: "nonce", updated_at: new Date(now - 1_000).toISOString() }); // the last tick, 1 s ago
+		const r = await P.reconcileStuckQueued(dir, { now });
+		expect(r.settled).toBe("none");
+		expect(r.state).toBe("queued");
+		expect(r.reason).toContain("lease fresh");
 	});
 
 	it("a fresh lease does not hold back a done marker (ordering rule 1)", async () => {
