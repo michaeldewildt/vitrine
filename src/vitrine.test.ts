@@ -161,9 +161,10 @@ function fakePi(activeTools: string[] = [], opts: { coOwner?: boolean } = {}) {
 		setActiveToolsCalls,
 		sentMessages,
 		// test seam: fire the session_start handlers (pi does this after load)
-		// with the (event, ctx) pair pi hands them
-		fire: (event: unknown = { reason: "startup" }, ctx: unknown = fakeCtx()) => {
-			for (const h of sessionStart) h(event, ctx);
+		// with the (event, ctx) pair pi hands them — AWAITED: the handler is
+		// async (the fork-ancestry resolution reads the previous session's header)
+		fire: async (event: unknown = { reason: "startup" }, ctx: unknown = fakeCtx()): Promise<void> => {
+			for (const h of sessionStart) await h(event, ctx);
 		},
 		// test seam: fire the session_shutdown handlers (the watcher's close)
 		fireShutdown: () => {
@@ -534,11 +535,11 @@ describe("worker mode (exactly one tool)", () => {
 });
 
 describe("dispatcher mode (cutover + the dispatch tool)", () => {
-	it("registers vitrine_dispatch when the name is free", () => {
+	it("registers vitrine_dispatch + vitrine_collect when the name is free", () => {
 		delete process.env.VITRINE_TASK_DIR;
 		const fake = fakePi();
 		vitrine(fake.api);
-		expect(fake.tools.map((t) => t.name)).toEqual(["vitrine_dispatch"]);
+		expect(fake.tools.map((t) => t.name)).toEqual(["vitrine_dispatch", "vitrine_collect"]);
 		expect(fake.tools[0].parameters).toBeDefined();
 		// the cutover guard runs at session_start (pi 0.85.1 exposes no
 		// load-time introspection); with a free name it deactivates nothing
@@ -559,7 +560,7 @@ describe("dispatcher mode (cutover + the dispatch tool)", () => {
 			vitrine(fake.api);
 			// registration still happens at load (a registration cannot be
 			// retracted in pi 0.85.1) — the session_start guard is the refusal
-			expect(fake.tools.map((t) => t.name)).toEqual(["vitrine_dispatch"]);
+			expect(fake.tools.map((t) => t.name)).toEqual(["vitrine_dispatch", "vitrine_collect"]);
 			fake.fire();
 		} finally {
 			process.stderr.write = origErr;
@@ -715,9 +716,12 @@ describe("dispatch description (the roster is composed at load)", () => {
 		expect(d).toContain("Dispatch one or more tasks to specialist agents (pi agent files), each in its own visible workspace");
 		// the fixture agent's roster line: name + the FIRST sentence of its description
 		expect(d).toContain("- `test-agent`: fixture agent for the extension tests.");
-		// the authored policy lines
+		// the authored policy lines (R9: the dispatch names the collect — both tools point at each other)
 		expect(d).toContain(
 			"Dispatch when a side task would flood this context, for parallel mechanical units, or for an independent check; not for a single sequential unit or judgment work that needs the conversation.",
+		);
+		expect(d).toContain(
+			"Dispatch returns immediately — each task's result arrives as a delivery on settlement; never act on a worker's result in the same turn you dispatched it, and never busy-wait for it. vitrine_collect is the on-demand pull for a result you want now", 
 		);
 		expect(d).toContain(
 			"Project-local `.pi/agents/` agents shadow these when the project is trusted; an unknown-agent error lists the live roster.",
@@ -747,5 +751,137 @@ describe("dispatch description (the roster is composed at load)", () => {
 		vitrine(fake.api);
 		expect(fake.tools[0].name).toBe("vitrine_dispatch");
 		expect(fake.tools[0].description).toBe(composeDispatchDescription());
+	});
+});
+
+// ---------------------------------------------------------------------------
+// vitrine_collect (R6): the pull floor + the fork ancestry
+
+describe("vitrine_collect (the pull floor + the fork ancestry)", () => {
+	/** A session JSONL whose first line is the header (id, optional parentSession). */
+	const writeSessionFile = (name: string, id: string, parentSession?: string): Promise<void> => {
+		const hdr: Record<string, unknown> = { type: "session", version: 3, id, timestamp: new Date().toISOString(), cwd: base };
+		if (parentSession !== undefined) hdr.parentSession = parentSession;
+		return writeFile(join(sessionsRoot, name), JSON.stringify(hdr) + "\n");
+	};
+
+	/** A completed, undelivered, async task dispatched by `dispatcher` (the session id in spec). */
+	const mkCollectTask = async (answer: string, dispatcher: string): Promise<string> => {
+		const id = P.newTaskId();
+		const dir = join(tasksRoot, id);
+		const spec: P.TaskSpec = {
+			task_id: id,
+			agent: { name: "test-agent", body: "body\n" },
+			dispatcher_session_id: dispatcher,
+			cwd: base,
+			session_id: `vitrine.${id}`,
+			session_name: `test-agent · ${id.slice(0, 8)}`,
+			mode: "headless",
+			attended: false,
+			workspace: 9,
+			wall_timeout_s: 3600,
+			inactivity_s: 600,
+			auto_settle_s: 600,
+			auto_settle_grace_s: 60,
+			async: true,
+			created_at: new Date().toISOString(),
+			boot_id: P.currentBootId(),
+		};
+		await P.createTask(dir, spec, "collect fork test prompt\n");
+		await P.transitionState(dir, "queued", "running", { started_at: new Date(Date.now() - 42_000).toISOString() });
+		await writeFile(join(dir, "result.md"), answer);
+		await P.transitionState(dir, "running", "completed", { finished_at: new Date().toISOString() });
+		return id;
+	};
+
+	const collectOf = (fake: { tools: RegisteredTool[] }): ((params?: Record<string, unknown>) => Promise<string>) => {
+		const tool = fake.tools.find((t) => t.name === "vitrine_collect");
+		expect(tool).toBeDefined();
+		return async (params: Record<string, unknown> = {}) => {
+			const out = await tool!.execute!("c1", params, new AbortController().signal, undefined, fakeCtx());
+			return out.content.map((c) => c.text).join("\n");
+		};
+	};
+
+	it("the collect description carries the doctrine (dispatch returns immediately; collect is the on-demand pull; never busy-poll)", () => {
+		delete process.env.VITRINE_TASK_DIR;
+		const fake = fakePi();
+		vitrine(fake.api);
+		const collect = fake.tools.find((t) => t.name === "vitrine_collect");
+		expect(collect).toBeDefined();
+		const d = collect!.description ?? "";
+		// the doctrine: the pull floor, the never-blocks guarantee, the write semantics
+		expect(d).toContain("Pull vitrine results on demand");
+		expect(d).toContain("NEVER blocks on a running worker");
+		expect(d).toContain("never busy-poll collect inside a turn");
+		expect(d).toContain("writes the harvest-delivered marker");
+		expect(d).toContain("headlined without a body");
+	});
+
+	it("a fork's no-id collect finds the pre-fork task (the session_start fork ancestry)", async () => {
+		delete process.env.VITRINE_TASK_DIR;
+		const idA = P.newTaskId(); // the pre-fork dispatcher's session id (the file header id)
+		const fileA = join(sessionsRoot, `pre-fork-${idA.slice(0, 8)}.jsonl`);
+		await writeSessionFile(`pre-fork-${idA.slice(0, 8)}.jsonl`, idA);
+		// a completed, undelivered task dispatched BY the pre-fork session
+		const taskId = await mkCollectTask("the pre-fork answer\n", idA);
+		const fake = fakePi();
+		vitrine(fake.api);
+		// session_start for the FORK: previousSessionFile = the pre-fork file
+		await fake.fire({ reason: "fork", previousSessionFile: fileA });
+		const collect = collectOf(fake);
+		const text = await collect();
+		// the task is in the no-id scope via the fork ancestry — the harvest rides the fixed wrapper
+		expect(text).toContain("scope: this session + 1 fork ancestor(s)");
+		expect(text).toContain("the pre-fork answer");
+		expect(text).toContain(`test-agent · ${taskId.slice(0, 8)} — completed`);
+		// and it is marked delivered (the collect is a delivery) — the marker lands
+		expect(await P.harvestDeliveredId(join(tasksRoot, taskId))).toBeTruthy();
+	});
+
+	it("the fork ancestry chains through the parentSession header (a fork of a fork)", async () => {
+		delete process.env.VITRINE_TASK_DIR;
+		const idA = P.newTaskId();
+		const idB = P.newTaskId();
+		const fileA = join(sessionsRoot, `chain-a-${idA.slice(0, 8)}.jsonl`);
+		const fileB = join(sessionsRoot, `chain-b-${idB.slice(0, 8)}.jsonl`);
+		await writeSessionFile(`chain-a-${idA.slice(0, 8)}.jsonl`, idA);
+		await writeSessionFile(`chain-b-${idB.slice(0, 8)}.jsonl`, idB, fileA);
+		// tasks dispatched by TWO different ancestors (idB and idA)
+		const taskB = await mkCollectTask("the mid-ancestor answer\n", idB);
+		const taskA = await mkCollectTask("the root-ancestor answer\n", idA);
+		const fake = fakePi();
+		vitrine(fake.api);
+		// the fork's previousSessionFile is the immediate predecessor (fileB);
+		// its header's parentSession chains back to fileA (a fork of a fork)
+		await fake.fire({ reason: "fork", previousSessionFile: fileB });
+		const collect = collectOf(fake);
+		const text = await collect();
+		// both ancestors are in the resolved chain (idB + idA)
+		expect(text).toContain("scope: this session + 2 fork ancestor(s)");
+		expect(text).toContain("the mid-ancestor answer");
+		expect(text).toContain(`test-agent · ${taskB.slice(0, 8)} — completed`);
+		expect(text).toContain("the root-ancestor answer");
+		expect(text).toContain(`test-agent · ${taskA.slice(0, 8)} — completed`);
+	});
+
+	it("a non-fork session_start records no ancestry (session-scoped); explicit ids still cross sessions", async () => {
+		delete process.env.VITRINE_TASK_DIR;
+		const foreign = P.newTaskId(); // a session id that is NOT the current one and NOT a fork ancestor
+		const taskId = await mkCollectTask("the foreign-session answer\n", foreign);
+		const fake = fakePi();
+		vitrine(fake.api);
+		// a PLAIN startup (no fork) — the ancestry is empty
+		await fake.fire({ reason: "startup" });
+		const collect = collectOf(fake);
+		// no ids: the foreign task is OUT of scope (the scope is this session only)
+		const noScope = await collect();
+		expect(noScope).toContain("scope: this session");
+		expect(noScope).not.toContain("the foreign-session answer");
+		// an explicit id crosses any session — the task is found + marked
+		const byId = await collect({ ids: [taskId.slice(0, 8)] });
+		expect(byId).toContain("scope: explicit ids");
+		expect(byId).toContain("the foreign-session answer");
+		expect(await P.harvestDeliveredId(join(tasksRoot, taskId))).toBeTruthy();
 	});
 });

@@ -21,6 +21,7 @@
  * the ownership check runs at `session_start` (see below).
  */
 import { appendFileSync, realpathSync, statSync } from "node:fs";
+import { open } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getMarkdownTheme, type ExtensionAPI, type ExtensionToolContext, type ToolResult } from "@earendil-works/pi-coding-agent";
@@ -29,11 +30,13 @@ import { Type } from "typebox";
 import { Compile } from "typebox/compile";
 import * as P from "./protocol";
 import * as D from "./dispatch";
+import { collectTasks } from "./collect";
 import { startSessionWatcher, type DeliveryOptions, type HarvestMessage, type SessionWatcher } from "./watcher";
 import { listAgentSummaries } from "./agents";
 import { makeDoneRenderers, type DoneRenderDeps } from "./done-render";
 
 const DISPATCH_TOOL = "vitrine_dispatch";
+const COLLECT_TOOL = "vitrine_collect";
 const DONE_TOOL = "vitrine_done";
 
 /**
@@ -71,6 +74,28 @@ const DISPATCH_MECHANICS =
 	"pi's docs call starting a new agent 'spawn' — this is that spawn: it starts one worker per task and dispatches the task to it.";
 
 /**
+ * The `vitrine_collect` mechanics (R9): the pull-floor doctrine — dispatch
+ * returns immediately and results arrive as a delivery; collect is the
+ * on-demand pull for a result you want now; never busy-poll collect inside
+ * a turn. The per-task shapes and the write semantics ride the description
+ * (the tool is its own documentation — the doctrine the delivery's risk
+ * section bounds).
+ */
+const COLLECT_MECHANICS =
+	"Pull vitrine results on demand — the pull floor that complements vitrine_dispatch: dispatch returns immediately (ids + state, no harvest) " +
+	"and each task's harvest arrives as a delivery on settlement; this tool is how you get a result when you want it now. " +
+	"It answers immediately from disk and NEVER blocks on a running worker — so never busy-poll collect inside a turn to wait a worker out: " +
+	"the delivery is the result path, and a turn that dispatched must not act on the result in the same turn.\n" +
+	"Per task: terminal → the full harvest in the fixed wrapper (capped — the 0600 overflow file's path is named in the body, and reading it " +
+	"is the sanctioned response to a truncated body) + delivery status; running/queued → a status line (state, elapsed, workspace) with no body; " +
+	"a terminal task a human resumed in its tile → the session's latest output as an advisory note (never a state change, never a re-delivery).\n" +
+	"No ids = all tasks of this session plus its fork ancestry (the pre-fork dispatcher's tasks). ids = explicit task ids (full, or the short " +
+	"8-char prefix from the dispatch return) — they cross any session.\n" +
+	"A collect that harvests a terminal task writes the harvest-delivered marker (a fresh collect-scoped batch id) — the collect is a delivery " +
+	"to this session's context, so replay and gc treat the task as delivered. Undelivered attended tasks are headlined without a body — " +
+	"attended workspaces are the human's; pulling their harvest is an explicit id.";
+
+/**
  * Compose the `vitrine_dispatch` description:
  * the mechanics paragraph, then — only when the global agents dir yields
  * entries — one roster line per agent (`- \`name\`: first sentence`, from
@@ -94,7 +119,8 @@ export function composeDispatchDescription(): string {
 	}
 	parts.push(
 		"Dispatch when a side task would flood this context, for parallel mechanical units, or for an independent check; not for a single sequential unit or judgment work that needs the conversation.\n" +
-			"Dispatch returns immediately — each task's result arrives as a delivery on settlement; never act on a worker's result in the same turn you dispatched it, and never busy-wait for it.\n" +
+			"Dispatch returns immediately — each task's result arrives as a delivery on settlement; never act on a worker's result in the same turn you dispatched it, and never busy-wait for it. " +
+			"vitrine_collect is the on-demand pull for a result you want now (an explicit status check, a re-harvest after a human resumed a worker, or a delivery-path diagnosis) — pull when you want it, never busy-poll collect inside a turn.\n" +
 			"Project-local `.pi/agents/` agents shadow these when the project is trusted; an unknown-agent error lists the live roster.",
 	);
 	return parts.join("\n\n");
@@ -343,6 +369,55 @@ export default function vitrine(pi: ExtensionAPI): void {
 		},
 	});
 
+	// The pull floor (R6): main-session only (the worker mode above already
+	// returned — a worker never sees it). It answers immediately from disk
+	// (never blocks on a worker) and reuses the delivery's fixed wrapper +
+	// harvest machinery (no second shape). The write semantics: a collect
+	// that harvests a terminal task writes `harvest-delivered` (a fresh
+	// collect-scoped batch id) — replay and gc then treat the task as
+	// delivered. The scope: this session + the fork ancestry (recorded at
+	// session_start, below); explicit ids cross any session.
+	pi.registerTool({
+		name: COLLECT_TOOL,
+		label: "Vitrine collect",
+		description: COLLECT_MECHANICS,
+		parameters: Type.Object({
+			ids: Type.Optional(
+				Type.Array(
+					Type.String({
+						description:
+							"Optional task ids (full ids, or the short 8-char prefix from the dispatch return) — they cross any session. " +
+							"Omitted: all tasks of this session plus its fork ancestry.",
+					}),
+					{ minItems: 1, description: "1–8 task ids; a short prefix must match exactly one task." },
+				),
+			),
+		}),
+		async execute(
+			_toolCallId: string,
+			params: Record<string, unknown>,
+			_signal: AbortSignal,
+			// pi's streaming callback — unused (the collect answers in one
+			// shot from disk; there is nothing to stream).
+			_onUpdate?: (update: { content: Array<{ type: "text"; text: string }>; details?: unknown }) => void,
+			ctx?: ExtensionToolContext,
+		): Promise<ToolResult> {
+			if (ctx === undefined) {
+				throw new Error("vitrine_collect needs the extension tool context (ctx) — pi version mismatch?");
+			}
+			const ids = Array.isArray(params.ids) ? params.ids.filter((s): s is string => typeof s === "string") : undefined;
+			const res = await collectTasks({
+				sessionId: ctx.sessionManager.getSessionId(),
+				ancestryIds: forkAncestry,
+				...(ids !== undefined && ids.length > 0 ? { ids } : {}),
+			});
+			return {
+				content: [{ type: "text", text: res.text }],
+				details: { batch: res.batch, headlined: res.headlined, notes: res.notes, rows: res.rows },
+			};
+		},
+	});
+
 	// Cutover rule: one name, one owner — refuse rather than
 	// shadow. pi 0.85.1 exposes no load-time tool introspection
 	// (getActiveTools/getAllTools are action methods that throw during
@@ -365,6 +440,12 @@ export default function vitrine(pi: ExtensionAPI): void {
 	// owned from the pass onward), and closes at session_shutdown (nothing
 	// settles on close).
 	let watcher: SessionWatcher | null = null;
+	// The fork ancestry (R6): the pre-fork dispatcher's session ids, recorded
+	// from `session_start { reason: "fork", previousSessionFile }` — a fork's
+	// no-id vitrine_collect still finds the pre-fork tasks (explicit ids cross
+	// any session regardless). Reset on every session_start (pi re-binds the
+	// extension per session — the watcher reset below is the precedent).
+	let forkAncestry: string[] = [];
 	const sendHarvest: (message: HarvestMessage, options: DeliveryOptions) => Promise<void> = (message, options) => {
 		// The floor check (R8) made sendMessage part of the declared surface —
 		// the runtime guard is for a genuinely older pi than the stubs assume.
@@ -380,7 +461,7 @@ export default function vitrine(pi: ExtensionAPI): void {
 		watcher = startSessionWatcher({ sessionId, send: sendHarvest, replay, bunBin: D.resolveBunBin });
 	};
 
-	const onSessionStart = (_event: unknown, ctx: unknown): void => {
+	const onSessionStart = async (event: unknown, ctx: unknown): Promise<void> => {
 		try {
 			const entry = pi.getAllTools().find((t) => t.name === DISPATCH_TOOL);
 			const ownPath = safeRealpath(fileURLToPath(import.meta.url));
@@ -401,6 +482,13 @@ export default function vitrine(pi: ExtensionAPI): void {
 		// replayed (one coalesced message, the `replay:` header). The reason
 		// (startup/resume/fork) only changes what the model already knows —
 		// the replay predicate is global in every case.
+		// The fork ancestry (R6): the previous session file resolves to the
+		// pre-fork session's id (the file's header line), and its own
+		// `parentSession` header field chains back through any further forks —
+		// the tasks those sessions dispatched carry `spec.dispatcher_session_id`
+		// = one of these ids, so a fork's no-id collect still finds them.
+		const ev = (event ?? {}) as { reason?: string; previousSessionFile?: string };
+		forkAncestry = ev.reason === "fork" && typeof ev.previousSessionFile === "string" ? await forkAncestryIds(ev.previousSessionFile) : [];
 		const sm = (ctx as { sessionManager?: { getSessionId(): string } } | null | undefined)?.sessionManager;
 		if (typeof sm?.getSessionId === "function") {
 			const sessionId = sm.getSessionId();
@@ -426,4 +514,51 @@ function safeRealpath(p: string): string | undefined {
 	} catch {
 		return undefined;
 	}
+}
+
+/**
+ * The session file's header (the first line) — a BOUNDED read: the session
+ * file is pi-owned, append-only, and can be multi-megabytes, and only the
+ * first line (the SessionHeader: `id` + `parentSession` on a forked file) is
+ * needed. `null` when unreadable or the first line is empty/torn.
+ */
+async function readSessionHeaderLine(path: string): Promise<Record<string, unknown> | null> {
+	const fh = await open(path, "r").catch(() => null);
+	if (fh === null) return null;
+	try {
+		const buf = Buffer.alloc(65536);
+		const { bytesRead } = await fh.read(buf, 0, 65536, 0);
+		let text = buf.subarray(0, bytesRead).toString("utf8");
+		const nl = text.indexOf("\n");
+		if (nl >= 0) text = text.slice(0, nl);
+		if (text.trim() === "") return null;
+		return JSON.parse(text) as Record<string, unknown>;
+	} catch {
+		return null;
+	} finally {
+		await fh.close().catch(() => null);
+	}
+}
+
+/**
+ * The fork-ancestry ids (R6): the previous session file's header `id`, then
+ * the chain of its `parentSession` headers (a fork of a fork). These are the
+ * pre-fork dispatcher session ids — the tasks those sessions dispatched
+ * carry `spec.dispatcher_session_id` = one of them, so a fork's no-id
+ * vitrine_collect still finds the pre-fork tasks. An unreadable header or a
+ * cycle ends the chain (a hop cap guards a pathological one); a fork's
+ * collect degrades to the session-scoped set, and explicit ids always work.
+ */
+async function forkAncestryIds(previousSessionFile: string): Promise<string[]> {
+	const ids: string[] = [];
+	const seen = new Set<string>();
+	let file: string | undefined = previousSessionFile;
+	for (let hops = 0; file !== undefined && hops < 32 && !seen.has(file); hops++) {
+		seen.add(file);
+		const hdr = await readSessionHeaderLine(file);
+		if (hdr === null || typeof hdr.id !== "string") break;
+		ids.push(hdr.id);
+		file = typeof hdr.parentSession === "string" ? hdr.parentSession : undefined;
+	}
+	return ids;
 }

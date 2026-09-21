@@ -124,6 +124,13 @@ export interface DeliveryTask {
 	replay: boolean;
 	/** The settlement time (`state.json` `finished_at`) — rides the message `details` for provenance (R4). */
 	settledAt?: string;
+	/**
+	 * The resumed-session advisory note (unit 3, R5/R6): the session's latest
+	 * output after a human resumed a terminal task — advisory, NEVER a state
+	 * change, never a re-delivery. Set by `vitrine_collect` on a terminal task
+	 * with the `resumed` event; the delivery never sets it.
+	 */
+	advisory?: string;
 }
 
 /**
@@ -147,6 +154,10 @@ export function buildHarvestMessage(batch: string, tasks: DeliveryTask[]): Harve
 			if (t.dataText !== undefined) {
 				lines.push("", "typed data (declared output_schema):");
 				lines.push(t.dataText);
+			}
+			if (t.advisory !== undefined) {
+				lines.push("", "advisory (resumed after settlement — the session's latest output; never a state change, never a re-delivery):");
+				lines.push(t.advisory);
 			}
 		}
 	});
@@ -460,9 +471,11 @@ export function startSessionWatcher(opts: SessionWatcherOptions): SessionWatcher
  * The per-task settlement duration for the header line: `finished_at` −
  * `started_at`; a task that never ran (no `started_at`) measures from its
  * creation (`spec.created_at`). `undefined` when the timestamps are absent
- * or unparseable (the header line omits the segment).
+ * or unparseable (the header line omits the segment). Exported: the
+ * collect's terminal rows reuse it (R6 — the same elapsed segment the
+ * delivery header carries).
  */
-function elapsedOf(st: P.TaskStateRecord, spec: P.TaskSpec): string | undefined {
+export function elapsedOf(st: P.TaskStateRecord, spec: P.TaskSpec): string | undefined {
 	const end = st.finished_at !== undefined ? Date.parse(st.finished_at) : NaN;
 	const start = st.started_at !== undefined ? Date.parse(st.started_at) : Date.parse(spec.created_at);
 	if (!Number.isFinite(end) || !Number.isFinite(start)) return undefined;

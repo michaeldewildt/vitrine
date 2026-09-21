@@ -234,7 +234,7 @@ describe("gc", () => {
 		expect(r.lines).toContain("gc: nothing to remove");
 	});
 
-	it("an undelivered async task dir is never gc'd (the delivery owns it until the harvest-delivered marker)", async () => {
+	it("an undelivered async task dir is never gc'd (the delivery owns it until the harvest-delivered marker) — and the skip is noted", async () => {
 		const dir = await newTask({ async: true });
 		await P.transitionState(dir, "queued", "running", {});
 		await P.transitionState(dir, "running", "completed", {}, "done");
@@ -244,10 +244,14 @@ describe("gc", () => {
 		await writeFile(join(dir, "state.json"), JSON.stringify(st, null, 2) + "\n");
 		const r = await runCli(["gc"], { ...QUIET, now: () => NOW });
 		expect(r.lines).toContain("gc: nothing to remove");
-		// once the delivery writes the marker, the plain retention rule applies again
+		// the skip is noted in the output (R5): the dir is unretirable by gc until delivered
+		expect(r.lines.join("\n")).toContain("skipped 1 undelivered async task(s)");
+		expect(r.lines.join("\n")).toContain("vitrine_collect with the task id delivers and marks it");
+		// once the delivery writes the marker, the plain retention rule applies again (and the note is gone)
 		await P.writeHarvestDelivered(dir, "batch-x");
 		const r2 = await runCli(["gc"], { ...QUIET, now: () => NOW });
 		expect(r2.lines.join("\n")).toContain("removed " + P.taskIdOf(dir));
+		expect(r2.lines.join("\n")).not.toContain("skipped");
 	});
 });
 

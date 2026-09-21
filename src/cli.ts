@@ -60,6 +60,17 @@ function formatAge(ms: number): string {
 	return `${Math.floor(h / 24)}d`;
 }
 
+/**
+ * The gc-boundary note (R5): an undelivered async task dir is SKIPPED by gc
+ * (its harvest has not been delivered — retiring it would lose an undelivered
+ * result), and the skip is noted in the output. Retiring one is an explicit
+ * operator act: deliver it (e.g. `vitrine_collect` with the task's id, which
+ * writes the harvest-delivered marker) and the plain retention rule applies.
+ */
+function gcSkipNote(n: number): string {
+	return `gc: skipped ${n} undelivered async task(s) (no harvest-delivered marker — vitrine_collect with the task id delivers and marks it; retiring one is an explicit operator act)`;
+}
+
 export interface CliDeps {
 	now?: () => number;
 	/** Injectable task-dir removal (gc). */
@@ -263,6 +274,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<CliRes
 		const dirs = await P.listTaskDirs();
 		let removed = 0;
 		let previewed = 0;
+		let skippedUndelivered = 0;
 		for (const dir of dirs) {
 			const st = await P.readState(dir).catch(() => null);
 			if (st === null || !P.isTerminal(st.state)) continue;
@@ -277,7 +289,10 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<CliRes
 			// once delivered). The `async` spec flag is the upgrade boundary:
 			// historical dirs carry no flag, so the plain retention rule applies
 			// to them as before
-			if (spec?.async === true && (await P.harvestDeliveredId(dir)) === null) continue;
+			if (spec?.async === true && (await P.harvestDeliveredId(dir)) === null) {
+				skippedUndelivered++;
+				continue;
+			}
 			const finished = st.finished_at !== undefined ? Date.parse(st.finished_at) : spec?.created_at !== undefined ? Date.parse(spec.created_at) : now();
 			const age = now() - finished;
 			if (age < retentionMs + GC_GRACE_MS) continue;
@@ -293,9 +308,11 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<CliRes
 		}
 		if (dryRun) {
 			if (previewed === 0) emit("gc --dry-run: nothing to remove");
+			if (skippedUndelivered > 0) emit(gcSkipNote(skippedUndelivered));
 			return { code: 0, lines };
 		}
 		if (removed === 0) emit("gc: nothing to remove");
+		if (skippedUndelivered > 0) emit(gcSkipNote(skippedUndelivered));
 		return { code: 0, lines };
 	}
 
