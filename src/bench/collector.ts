@@ -31,8 +31,11 @@ import { readFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { parseSessionEntries, totalCostUsd } from "../session";
 
-/** The terminal states (local — the collector imports no protocol module). */
-const TERMINAL_STATES: ReadonlySet<string> = new Set(["completed", "failed", "killed", "timeout", "crashed"]);
+/** The terminal states (local — the collector imports no protocol module).
+ * Exported so a test can assert set equality with the protocol's
+ * `TERMINAL_STATES` (`src/protocol/state.ts`): a new protocol terminal state
+ * must not silently null out the collector's `settle` segment. */
+export const TERMINAL_STATES: ReadonlySet<string> = new Set(["completed", "failed", "killed", "timeout", "crashed"]);
 
 /** The e2e cross-check threshold: |terminal transition − finished_at| above this is noted. */
 export const E2E_MISMATCH_THRESHOLD_MS = 50;
@@ -54,6 +57,8 @@ export interface BenchRow {
 	work_ms: number | null;
 	poll_ms: number | null;
 	settle_ms: number | null;
+	/** The observation point behind poll/settle: null on the normal path (a `marker-observed` event is present), or `"worker-exit"` when the headless content-gate completion path wrote a done-marker but emitted no marker-observed event — the wrapper's `worker-exit` event stands in for the observation point. */
+	marker_observed_by: string | null;
 	e2e_ms: number | null;
 	/** Cross-check: |terminal transition ts − state.json finished_at| when it exceeds the 50 ms threshold (else null). */
 	e2e_mismatch_ms: number | null;
@@ -158,6 +163,7 @@ export async function collectRow(dir: string): Promise<BenchRow> {
 		work_ms: null,
 		poll_ms: null,
 		settle_ms: null,
+		marker_observed_by: null,
 		e2e_ms: null,
 		e2e_mismatch_ms: null,
 		harness_ratio: null,
@@ -200,13 +206,27 @@ export async function collectRow(dir: string): Promise<BenchRow> {
 		const markerEv = firstEv((e) => e.event === "done-marker" || e.event === "vitrine_done");
 		const observedEv = firstEv((e) => e.event === "marker-observed");
 		const terminalEv = firstEv((e) => e.event === "transition" && TERMINAL_STATES.has(e.to ?? ""));
+		// The observation point behind poll/settle. The normal path has a
+		// `marker-observed` event (the wrapper's observation of the done-marker).
+		// The headless content-gate completion path (headless.ts branch 3: clean
+		// exit 0, idle assistant, no vitrine_done) writes the done-marker but
+		// emits NO marker-observed event — the worker exits and the wrapper
+		// settles. There the `worker-exit` event IS the observation point (it
+		// lands right after the marker, before the terminal transition), so
+		// fall back to it: poll = done-marker → worker-exit, settle =
+		// worker-exit → terminal. The row is marked `marker_observed_by:
+		// "worker-exit"` so the path stays distinguishable from drift. Genuinely
+		// absent data (no marker, or no worker-exit) stays null (missing).
+		const exitEv = firstEv((e) => e.event === "worker-exit");
+		const observed = observedEv !== undefined ? observedEv : markerEv !== undefined && exitEv !== undefined ? exitEv : undefined;
+		if (observedEv === undefined && observed !== undefined) row.marker_observed_by = "worker-exit";
 
 		const span = (a: Ev | undefined, b: Ev | undefined): number | null => (a !== undefined && b !== undefined ? b.ts - a.ts : null);
 		row.queue_ms = span(created, bootEv);
 		row.boot_ms = span(bootEv, sessionEv);
 		row.work_ms = span(sessionEv, markerEv);
-		row.poll_ms = span(markerEv, observedEv);
-		row.settle_ms = span(observedEv, terminalEv);
+		row.poll_ms = span(markerEv, observed);
+		row.settle_ms = span(observed, terminalEv);
 
 		// e2e = created → state.json finished_at; cross-check both against the
 		// terminal transition (a >50 ms mismatch is noted, not silently trusted)
@@ -294,6 +314,7 @@ export async function collectRows(dirs: string[]): Promise<BenchRow[]> {
 		work_ms: null,
 		poll_ms: null,
 		settle_ms: null,
+		marker_observed_by: null,
 		e2e_ms: null,
 		e2e_mismatch_ms: null,
 		harness_ratio: null,

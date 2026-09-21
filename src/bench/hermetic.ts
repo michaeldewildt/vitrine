@@ -54,9 +54,11 @@ export interface HermeticOptions {
 
 export interface SweepPoint {
 	tick_ms: number;
+	/** done-marker → marker-observed: the residual of the wrapper tick the done-marker landed in — the tick-sensitive cost (phase-dependent; expect ≤ tick_ms). */
 	poll_ms: number | null;
+	/** marker-observed → terminal transition: the in-tick state write — flat (~0–1 ms), not tick-sensitive. */
 	settle_ms: number | null;
-	/** marker → terminal (poll + settle, the settle phase under that tick). */
+	/** done-marker → terminal (poll + settle, the tail under that tick). */
 	tail_ms: number | null;
 	outcome: string;
 }
@@ -236,7 +238,7 @@ export async function runHermetic(opts: HermeticOptions = {}, out: (l: string) =
 			sweep[i].tail_ms = r.poll_ms !== null && r.settle_ms !== null ? r.poll_ms + r.settle_ms : null;
 		});
 		emit("");
-		emit(`Tick sweep — in-process wrapper, settle segments per wrapper tick (sanity: the settle phase grows with the tick; nothing is asserted):`);
+		emit(`Tick sweep — in-process wrapper: poll (done-marker → marker-observed, the residual of the tick the marker landed in — the tick-sensitive cost, phase-dependent, expect ≤ tick) vs settle (marker-observed → terminal, the in-tick state write — flat); nothing is asserted:`);
 		for (const s of sweep) {
 			emit(`  tick ${String(s.tick_ms).padEnd(5)}: poll ${fmtMs(s.poll_ms)} · settle ${fmtMs(s.settle_ms)} · marker→terminal ${fmtMs(s.tail_ms)} · ${s.outcome}`);
 		}

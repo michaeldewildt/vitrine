@@ -5,9 +5,16 @@
  * for every FIELD THE COLLECTOR READS — that the fixture's session output
  * and the real (anonymized, text-truncated) sample agree in TYPE and
  * PRESENCE. The known, documented exceptions are the named allow-lists
- * below (FIXTURE_OMITS / VALUE_DRIFT_OK). Any future protocol drift fails
- * this test loudly — a silent drift would otherwise corrupt the bench
- * metrics the collector computes from these files.
+ * below (FIXTURE_OMITS / VALUE_DRIFT_OK).
+ *
+ * What this actually pins: fixture↔sample drift, for every field the
+ * collector reads. The sample is a FROZEN capture of real pi, so a field
+ * rename in a FUTURE real pi changes neither side and this test stays green
+ * — it cannot see a pi upgrade. The guard is against the FIXTURE drifting
+ * from the shape the collector was built against, not against pi itself:
+ * a pi upgrade that changes the session shape requires regenerating
+ * test/fixtures/pi-session-sample.jsonl (a fresh capture) before the bench
+ * can trust the collector's fields.
  */
 import { describe, expect, it } from "bun:test";
 import { spawn } from "node:child_process";

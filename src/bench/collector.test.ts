@@ -11,7 +11,8 @@ import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { collectRow, collectRows, median, mediansOf } from "./collector";
+import { collectRow, collectRows, median, mediansOf, TERMINAL_STATES as COLLECTOR_TERMINAL_STATES } from "./collector";
+import { TERMINAL_STATES as PROTOCOL_TERMINAL_STATES } from "../protocol/state";
 import { renderMedians, renderTable, toJson } from "./report";
 
 let base: string;
@@ -299,5 +300,51 @@ describe("collector: medians + the report", () => {
 		const dumped = JSON.parse(toJson(rows)) as Array<Record<string, unknown>>;
 		expect(dumped).toHaveLength(3);
 		expect(dumped[0]).toHaveProperty("queue_ms", 1000);
+	});
+});
+
+describe("collector: the headless content-gate path (done-marker, no marker-observed)", () => {
+	// headless.ts branch 3: clean exit 0, idle assistant, no vitrine_done →
+	// done-marker (source headless-exit) → worker-exit → terminal transition.
+	// NO marker-observed event — the worker-exit event stands in for the
+	// observation point (poll = done-marker → worker-exit, settle =
+	// worker-exit → terminal), and the row is marked marker_observed_by.
+	const headlessEventsJsonl = (): string =>
+		[
+			{ ts: iso(0), event: "created", agent: "bench", mode: "headless", session_name: "bench · test" },
+			{ ts: iso(1000), event: "transition", from: "queued", to: "running", reason: "spawn" },
+			{ ts: iso(1500), event: "session", session_id: "vitrine.x" },
+			{ ts: iso(5000), event: "done-marker", source: "headless-exit" },
+			{ ts: iso(5900), event: "worker-exit", code: 0, signal: null, error: null },
+			{ ts: iso(5950), event: "transition", from: "running", to: "completed", reason: "headless-exit" },
+		]
+			.map((l) => JSON.stringify(l))
+			.join("\n") + "\n";
+
+	it("falls back to worker-exit as the observation point: segments computed, not null, not flagged incomplete-for-drift", async () => {
+		const sess = join(base, "sess6.jsonl");
+		await writeFile(sess, sessionFile());
+		const dir = await writeDir({
+			"spec.json": specJson(),
+			"state.json": stateJson(),
+			"session.json": sessionJson(sess),
+			"events.jsonl": headlessEventsJsonl(),
+		});
+		const row = await collectRow(dir);
+		expect(row.marker_observed_by).toBe("worker-exit");
+		expect(row.work_ms).toBe(3500); // session (1500) → done-marker (5000)
+		expect(row.poll_ms).toBe(900); // done-marker (5000) → worker-exit (5900)
+		expect(row.settle_ms).toBe(50); // worker-exit (5900) → terminal (5950)
+		expect(row.e2e_ms).toBe(5950);
+		expect(row.e2e_mismatch_ms).toBe(null); // terminal transition == finished_at
+		// the headless-exit path is a LIVE completion, not drift: the row is complete
+		expect(row.complete).toBe(true);
+		expect(row.missing).toEqual([]);
+	});
+});
+
+describe("collector: the terminal-state set tracks the protocol", () => {
+	it("the collector's TERMINAL_STATES equal the protocol's (a new protocol terminal state can't silently null out settle)", () => {
+		expect([...COLLECTOR_TERMINAL_STATES].sort()).toEqual([...PROTOCOL_TERMINAL_STATES].sort());
 	});
 });

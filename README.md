@@ -78,6 +78,8 @@ src/bench/                            the perf-eval core — the pure collector
   headless driver behind `vitrine bench hermetic`) · battery.ts (the
   versioned live battery + the pure outcome oracles) · live.ts (the live
   driver behind `vitrine bench live` — the real model, the local seats)
+  the conformance canary (conformance.test.ts) pins the fixture against
+  test/fixtures/pi-session-sample.jsonl — regenerate that sample on a pi upgrade that changes the session shape
 test/helpers.ts, test/fixtures/fake-pi.ts    shared test base + the fixture pi binary
 agents/                                       the shipped worker agent files
 docs/example-agent.md                         the copyable agent template
