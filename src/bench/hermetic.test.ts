@@ -11,7 +11,7 @@ import { appendFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runHermetic } from "./hermetic";
-import { appendHistory, lastPriorFor, readHistory, type BenchHistoryRecord } from "./history";
+import { appendHistory, historyPath, lastPriorFor, readHistory, REPO_ROOT, type BenchHistoryRecord } from "./history";
 
 describe("hermetic driver", () => {
 	it("a mini run completes the full chain (skipHistory keeps the machine's file clean)", async () => {
@@ -55,6 +55,17 @@ describe("hermetic driver", () => {
 });
 
 describe("history", () => {
+	it("historyPath honors the VITRINE_BENCH_HISTORY override (the test hook keeps the machine's file clean)", () => {
+		expect(historyPath()).toBe(join(REPO_ROOT, "state", "bench", "history.jsonl")); // the default (repo-relative)
+		const override = join(tmpdir(), "vitrine-bench-history-override.jsonl");
+		process.env.VITRINE_BENCH_HISTORY = override;
+		try {
+			expect(historyPath()).toBe(override); // the override wins — appendHistory/readHistory route through it
+		} finally {
+			delete process.env.VITRINE_BENCH_HISTORY;
+		}
+	});
+
 	it("append + read round-trip; lastPriorFor finds the last prior record with the same hostname", async () => {
 		const tmp = await mkdtemp(join(tmpdir(), "vitrine-bench-hist-"));
 		const path = join(tmp, "history.jsonl");

@@ -55,8 +55,14 @@ export interface BenchHistoryRecord {
 	medians: Medians;
 }
 
-/** The history file: `<repo>/state/bench/history.jsonl` (gitignored). */
+/** The history file: `<repo>/state/bench/history.jsonl` (gitignored).
+ * `VITRINE_BENCH_HISTORY` overrides the path — the test hook that points a
+ * run (including the CLI-level `bench` tests, which run the full driver
+ * without `skipHistory`) at a tmp file so `bun test` never touches the
+ * machine's history, which is the warn-gate baseline for the next real run. */
 export function historyPath(): string {
+	const override = process.env.VITRINE_BENCH_HISTORY;
+	if (override !== undefined && override !== "") return override;
 	return join(REPO_ROOT, "state", "bench", "history.jsonl");
 }
 

@@ -18,6 +18,7 @@ let base: string;
 let realHome: string;
 let realTasksRoot: string | undefined;
 let realSessionsDir: string | undefined;
+let realBenchHistory: string | undefined;
 const NOW = Date.parse("2026-09-16T12:00:00Z");
 
 function makeSpec(taskId: string, over: Partial<P.TaskSpec> = {}): P.TaskSpec {
@@ -55,9 +56,15 @@ beforeAll(async () => {
 	realHome = process.env.HOME ?? "";
 	realTasksRoot = process.env.VITRINE_TASKS_ROOT;
 	realSessionsDir = process.env.VITRINE_SESSIONS_DIR;
+	realBenchHistory = process.env.VITRINE_BENCH_HISTORY;
 	process.env.HOME = base;
 	process.env.VITRINE_TASKS_ROOT = join(base, "tasks");
 	process.env.VITRINE_SESSIONS_DIR = join(base, "sessions");
+	// The CLI-level `bench` tests run the full driver (hermetic + live) WITHOUT
+	// skipHistory. The history path is the one IO seam they leave behind — the
+	// drivers resolve it repo-relative, not through HOME — so point it at a tmp
+	// file: no test may touch the machine's history (the warn-gate baseline).
+	process.env.VITRINE_BENCH_HISTORY = join(base, "bench-history.jsonl");
 });
 
 afterAll(async () => {
@@ -66,6 +73,8 @@ afterAll(async () => {
 	else process.env.VITRINE_TASKS_ROOT = realTasksRoot;
 	if (realSessionsDir === undefined) delete process.env.VITRINE_SESSIONS_DIR;
 	else process.env.VITRINE_SESSIONS_DIR = realSessionsDir;
+	if (realBenchHistory === undefined) delete process.env.VITRINE_BENCH_HISTORY;
+	else process.env.VITRINE_BENCH_HISTORY = realBenchHistory;
 	await rm(base, { recursive: true, force: true });
 });
 
