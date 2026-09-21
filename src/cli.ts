@@ -16,6 +16,17 @@
  *                           whose wrapper pid is still alive; manual, not a
  *                           daemon; --dry-run previews and removes
  *                           nothing)
+ *   vitrine bench hermetic [--runs n] [--json]
+ *                           the hermetic perf suite: runs the full chain
+ *                           (real dispatch → real wrapper subprocess → the pi
+ *                           shim → fake-pi) k times at fixed latency (battery
+ *                           A), a 4-task batch-admission call (battery B), and
+ *                           the in-process wrapper tick sweep; prints the
+ *                           metrics table, appends the run to
+ *                           state/bench/history.jsonl (gitignored) and
+ *                           soft-warns (>20% boot/settle regression vs the
+ *                           last prior run on this host — report-only)
+ *   vitrine bench live  reserved for the live suite (not yet implemented)
  *
  * `runCli` is exported and deps-injected; the entry below just wires it to
  * argv/stdout. Exit codes: 0 ok · 1 failure (bad id, unknown task, kill error)
@@ -28,7 +39,7 @@ import { isMainModule } from "./main-guard";
 import * as P from "./protocol";
 import * as C from "./config";
 
-const VERBS = ["list", "show", "kill", "gc", "help"] as const;
+const VERBS = ["list", "show", "kill", "gc", "bench", "help"] as const;
 const GC_GRACE_MS = 60_000;
 
 function formatAge(ms: number): string {
@@ -77,24 +88,42 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<CliRes
 	const verb = argv[0];
 
 	if (verb === undefined || verb === "help") {
-		emit("usage: vitrine <list [--json] | show <task_id> | kill <task_id> | gc [--dry-run]>");
+		emit("usage: vitrine <list [--json] | show <task_id> | kill <task_id> | gc [--dry-run] | bench <hermetic|live> [--runs n] [--json] | help>");
 		return { code: verb === "help" ? 0 : 2, lines };
 	}
 	if (!(VERBS.includes(verb as (typeof VERBS)[number]) as boolean)) {
 		return fail(`vitrine: unknown verb '${verb}' (expected: ${VERBS.join(", ")})`, 2);
 	}
 
-	// flags: list --json · gc --dry-run — any other flag is a usage error
+	// flags: list --json · gc --dry-run · bench <sub> [--runs n] [--json] — any other flag is a usage error
 	let json = false;
 	let dryRun = false;
-	for (const a of argv.slice(1)) {
-		if (a === "--json" && verb === "list") json = true;
-		else if (a === "--dry-run" && verb === "gc") dryRun = true;
-		else if (a.startsWith("--"))
-			return fail(
-				`usage: vitrine ${verb === "list" ? "list [--json]" : verb === "gc" ? "gc [--dry-run]" : verb} — unknown flag '${a}'`,
-				2,
-			);
+	let benchRuns = 5;
+	const benchUsage = "usage: vitrine bench <hermetic|live> [--runs n] [--json]";
+	if (verb === "bench") {
+		const sub = argv[1];
+		if (sub !== "hermetic" && sub !== "live") return fail(`${benchUsage}${sub !== undefined ? ` — unknown sub-verb '${sub}'` : ""}`, 2);
+		for (let i = 2; i < argv.length; i++) {
+			const a = argv[i];
+			if (a === "--json") json = true;
+			else if (a === "--runs") {
+				const n = argv[i + 1] ?? "";
+				if (!/^[1-9][0-9]*$/.test(n)) return fail(`${benchUsage} — --runs takes a positive integer`, 2);
+				benchRuns = Number(n);
+				i++;
+			} else if (a.startsWith("--")) return fail(`${benchUsage} — unknown flag '${a}'`, 2);
+			else return fail(`${benchUsage} — unexpected argument '${a}'`, 2);
+		}
+	} else {
+		for (const a of argv.slice(1)) {
+			if (a === "--json" && verb === "list") json = true;
+			else if (a === "--dry-run" && verb === "gc") dryRun = true;
+			else if (a.startsWith("--"))
+				return fail(
+					`usage: vitrine ${verb === "list" ? "list [--json]" : verb === "gc" ? "gc [--dry-run]" : verb} — unknown flag '${a}'`,
+					2,
+				);
+		}
 	}
 
 	// show / kill share the id validation + the task-dir gate (same codes:
@@ -246,6 +275,18 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<CliRes
 		}
 		if (removed === 0) emit("gc: nothing to remove");
 		return { code: 0, lines };
+	}
+
+	// ---- bench -----------------------------------------------------------------
+	if (verb === "bench") {
+		if (argv[1] === "live") return fail("vitrine bench live: not yet implemented (the flag surface is reserved for the live suite)", 2);
+		// the driver is heavy (dispatch + wrapper chain) — load it on demand
+		const { runHermetic } = await import("./bench/hermetic");
+		// --json: one line of fixed-shape JSON (the history record); the text
+		// report goes to the no-op sink so the JSON line stands alone
+		const r = await runHermetic({ runs: benchRuns }, json ? () => {} : (l) => emit(l));
+		if (json) emit(JSON.stringify(r.record));
+		return { code: r.code, lines };
 	}
 
 	// unreachable (the verb is checked above)

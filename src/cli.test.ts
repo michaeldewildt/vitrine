@@ -361,3 +361,44 @@ describe("list --json", () => {
 		expect(errs.join(" ")).toContain("usage");
 	});
 });
+
+describe("bench", () => {
+	it("bench live ⇒ exit 2, not yet implemented (the flag surface is reserved)", async () => {
+		const errs: string[] = [];
+		const r = await runCli(["bench", "live"], { ...QUIET, err: (l) => errs.push(l) });
+		expect(r.code).toBe(2);
+		expect(errs.join(" ")).toContain("not yet implemented");
+	});
+
+	it("bench without a sub-verb ⇒ usage (stderr), exit 2", async () => {
+		const errs: string[] = [];
+		const r = await runCli(["bench"], { ...QUIET, err: (l) => errs.push(l) });
+		expect(r.code).toBe(2);
+		expect(errs.join(" ")).toContain("usage: vitrine bench");
+	});
+
+	it("bench hermetic --runs 0 / --runs abc / --runs (missing value) ⇒ usage, exit 2", async () => {
+		for (const argv of [["bench", "hermetic", "--runs", "0"], ["bench", "hermetic", "--runs", "abc"], ["bench", "hermetic", "--runs"]]) {
+			const r = await runCli(argv, QUIET);
+			expect(r.code).toBe(2);
+		}
+	});
+
+	it("bench hermetic --bogus ⇒ usage, exit 2", async () => {
+		const r = await runCli(["bench", "hermetic", "--bogus"], QUIET);
+		expect(r.code).toBe(2);
+	});
+
+	it("bench hermetic runs the driver and exits 0 (--json: one line of record JSON, no text report)", async () => {
+		const r = await runCli(["bench", "hermetic", "--runs", "1", "--json"], QUIET);
+		expect(r.code).toBe(0);
+		// --json: exactly one line — the history record (fixed shape)
+		expect(r.lines).toHaveLength(1);
+		const rec = JSON.parse(r.lines[0]) as Record<string, unknown>;
+		expect(rec.suite).toBe("hermetic");
+		expect((rec.params as Record<string, unknown>).runs).toBe(1);
+		expect(Array.isArray(rec.rows)).toBe(true);
+		expect(typeof (rec.medians as Record<string, unknown>).boot_ms).toBe("number");
+		expect(typeof (rec.medians as Record<string, unknown>).settle_ms).toBe("number");
+	}, 120_000);
+});
