@@ -11,7 +11,7 @@
  */
 import { describe, expect, it, beforeAll, afterAll, mock } from "bun:test";
 import { chmodSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -238,6 +238,83 @@ describe("worker mode (exactly one tool)", () => {
 		expect(marker).toMatchObject({ source: "vitrine_done" });
 		const events = (await P.readEvents(dir)).map((e) => e.event);
 		expect(events).toContain("vitrine_done");
+		delete process.env.VITRINE_TASK_DIR;
+	});
+
+	it("vitrine_done with data (no schema): the payload is recorded to result.json (0600) alongside result.md", async () => {
+		const id = P.newTaskId();
+		const dir = join(tasksRoot, id);
+		const spec: P.TaskSpec = {
+			task_id: id,
+			agent: { name: "test-agent", body: "body\n" },
+			dispatcher_session_id: "disp-ext",
+			cwd: base,
+			session_id: `vitrine.${id}`,
+			session_name: `vitrine: test-agent · ${id.slice(0, 8)}`,
+			mode: "tile",
+			attended: false,
+			workspace: 9,
+			wall_timeout_s: 3600,
+			inactivity_s: 600,
+			auto_settle_s: 600,
+			auto_settle_grace_s: 60,
+			created_at: new Date().toISOString(),
+			boot_id: P.currentBootId(),
+		};
+		await P.createTask(dir, spec, "probe\n");
+		process.env.VITRINE_TASK_DIR = dir;
+		const { api, tools } = fakePi();
+		vitrine(api);
+		const data = { verdict: "pass", port: 8080 };
+		const out = await tools[0].execute!("call1", { answer: "done\n", data }, new AbortController().signal, undefined, fakeCtx());
+		expect(out.content[0].text).toContain("Done");
+		// the prose answer and the typed data stay orthogonal
+		expect(await readFile(join(dir, "result.md"), "utf8")).toBe("done\n");
+		expect(JSON.parse(await readFile(join(dir, "result.json"), "utf8"))).toEqual(data);
+		expect((await stat(join(dir, "result.json"))).mode & 0o777).toBe(0o600);
+		expect(await P.readDoneMarker(dir)).toMatchObject({ source: "vitrine_done" });
+		delete process.env.VITRINE_TASK_DIR;
+	});
+
+	it("vitrine_done with a declared output_schema: data is required and must satisfy it", async () => {
+		const id = P.newTaskId();
+		const dir = join(tasksRoot, id);
+		const outputSchema = { type: "object", properties: { port: { type: "integer" }, name: { type: "string" } }, required: ["port", "name"] };
+		const spec: P.TaskSpec = {
+			task_id: id,
+			agent: { name: "test-agent", body: "body\n" },
+			dispatcher_session_id: "disp-ext",
+			cwd: base,
+			session_id: `vitrine.${id}`,
+			session_name: `vitrine: test-agent · ${id.slice(0, 8)}`,
+			mode: "tile",
+			attended: false,
+			workspace: 9,
+			wall_timeout_s: 3600,
+			inactivity_s: 600,
+			auto_settle_s: 600,
+			auto_settle_grace_s: 60,
+			output_schema: outputSchema,
+			created_at: new Date().toISOString(),
+			boot_id: P.currentBootId(),
+		};
+		await P.createTask(dir, spec, "probe\n");
+		process.env.VITRINE_TASK_DIR = dir;
+		const { api, tools } = fakePi();
+		vitrine(api);
+		const sig = new AbortController().signal;
+		// the contract was declared, the payload is missing → the call errors (fail fast, nothing recorded)
+		await expect(tools[0].execute!("call1", { answer: "x\n" }, sig, undefined, fakeCtx())).rejects.toThrow(/declares an output_schema/);
+		expect(await P.readDoneMarker(dir)).toBeNull();
+		expect(await readFile(join(dir, "result.md"), "utf8").catch(() => null)).toBeNull();
+		// invalid data → the error carries the field messages (the worker retries with a fixed payload)
+		await expect(tools[0].execute!("call2", { answer: "x\n", data: { port: "nope" } }, sig, undefined, fakeCtx())).rejects.toThrow(/must be integer/);
+		expect(await P.readDoneMarker(dir)).toBeNull();
+		// valid data → recorded to result.json, marker written
+		const out = await tools[0].execute!("call3", { answer: "y\n", data: { port: 8080, name: "mikey" } }, sig, undefined, fakeCtx());
+		expect(out.content[0].text).toContain("Done");
+		expect(JSON.parse(await readFile(join(dir, "result.json"), "utf8"))).toEqual({ port: 8080, name: "mikey" });
+		expect(await P.readDoneMarker(dir)).toMatchObject({ source: "vitrine_done" });
 		delete process.env.VITRINE_TASK_DIR;
 	});
 

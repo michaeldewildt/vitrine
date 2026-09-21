@@ -7,8 +7,11 @@
  *   probe: the compositor reachability probe (tool-side only) picks the spawn
  *   shape — tile if reachable, headless otherwise, never the reverse.
  * - worker mode (`VITRINE_TASK_DIR` in env): registers exactly one tool,
- *   `vitrine_done(answer)` — writes `result.md` + `done.marker` and one
- *   `events.jsonl` line; never `state.json` (single-writer rule).
+ *   `vitrine_done(answer, data?)` — writes `result.md` (+ `result.json` when
+ *   `data` is present) + `done.marker` and one `events.jsonl` line; never
+ *   `state.json` (single-writer rule). When the task's spec declares an
+ *   `output_schema`, `data` is required and is validated against it at the
+ *   call (fail-fast — the worker sees the field errors and retries).
  *   No dispatch tool in worker mode.
  *
  * Cutover rule: one name, one owner — refuse rather than shadow;
@@ -20,6 +23,7 @@ import { fileURLToPath } from "node:url";
 import { getMarkdownTheme, type ExtensionAPI, type ExtensionToolContext, type ToolResult } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { Compile } from "typebox/compile";
 import * as P from "./protocol";
 import * as D from "./dispatch";
 import { listAgentSummaries } from "./agents";
@@ -154,6 +158,14 @@ export default function vitrine(pi: ExtensionAPI): void {
 				"call returns, stop immediately.",
 			parameters: Type.Object({
 				answer: Type.String({ description: "The final answer — written to result.md, model-facing on harvest." }),
+				data: Type.Optional(
+					Type.Unknown({
+						description:
+							"Optional typed data payload (arbitrary JSON) — written to result.json alongside the answer. " +
+							"REQUIRED when this task's dispatch declared an output_schema: the payload must satisfy that " +
+							"schema, otherwise this call errors (naming the offending fields) so you retry with a fixed payload.",
+					}),
+				),
 			}),
 			// Custom TUI rendering (v1.14): the answer is shown as
 			// markdown in the worker's own tile. Never called in headless mode.
@@ -161,15 +173,45 @@ export default function vitrine(pi: ExtensionAPI): void {
 			renderResult: doneRenderers.renderResult,
 			async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResult> {
 				const answer = typeof params.answer === "string" ? params.answer : "";
+				const data = params.data; // Type.Optional(Type.Unknown()) — present iff the model passed it
 				// Failure: let it throw — no try/catch. pi wraps a thrown error into
 				// an error tool result (isError: true): the worker sees the message
 				// and continues, and the wrapper's watchdogs remain the safety net.
 				// AgentToolResult carries no isError field, so throwing is the
 				// contract-faithful error path (a string result is a success to pi).
 				const d = await P.assertTaskDir(taskDir);
+				// The typed-harvest contract: when the dispatch declared an
+				// `output_schema`, `data` is REQUIRED and must satisfy the schema
+				// — validated at the call (fail-fast) so the worker retries with a
+				// fixed payload. The prose answer (result.md) and the typed data
+				// (result.json) stay orthogonal.
+				const spec = await P.readSpec(d);
+				if (spec.output_schema !== undefined) {
+					if (data === undefined) {
+						throw new Error(
+							"this task declares an output_schema — vitrine_done requires the `data` parameter (the contract was declared; the payload is missing)",
+						);
+					}
+					let validator;
+					try {
+						validator = Compile(spec.output_schema);
+					} catch (e: unknown) {
+						// the contract was declared and is unverifiable — fail closed
+						throw new Error(`the task's output_schema failed to compile — failing closed: ${e instanceof Error ? e.message : String(e)}`);
+					}
+					if (!validator.Check(data)) {
+						const detail = validator
+							.Errors(data)
+							.slice(0, 5)
+							.map((er) => `${er.instancePath === "" ? "(root)" : er.instancePath} ${er.message}`)
+							.join("; ");
+						throw new Error(`data does not satisfy the task's output_schema — ${detail}; fix the payload and call vitrine_done again`);
+					}
+				}
 				await P.writeResult(d, answer);
+				if (data !== undefined) await P.writeResultJson(d, data); // no schema + data present: still recorded (harmless)
 				await P.writeDoneMarker(d, "vitrine_done");
-				await P.appendEvent(d, { event: "vitrine_done", source: "worker" });
+				await P.appendEvent(d, { event: "vitrine_done", source: "worker", ...(data !== undefined ? { data: true } : {}) });
 				// A plain-string result crashes pi's TUI (getTextOutput dereferences
 				// `result.content`) and is silently dropped from the session record —
 				// the result must be a ToolResult object (pi 0.85.1, verified 2026-09-17).
@@ -178,7 +220,7 @@ export default function vitrine(pi: ExtensionAPI): void {
 				// (the keep-alive tile). The model-facing ack is unchanged.
 				return {
 					content: [{ type: "text", text: "Done. The answer is recorded; the wrapper will settle the task. Stop immediately." }],
-					details: { answer },
+					details: data === undefined ? { answer } : { answer, dataRecorded: true },
 				};
 			},
 		});
@@ -222,6 +264,14 @@ export default function vitrine(pi: ExtensionAPI): void {
 					timeout: Type.Optional(Type.Number({ description: "Wall-clock budget in seconds. Default: config wall_timeout_s." })),
 					inactivity: Type.Optional(Type.Number({ description: "Watchdog idle budget in seconds. Default: agent frontmatter → config inactivity_s." })),
 					max_cost_usd: Type.Optional(Type.Number({ description: "Max total session cost in USD; the cost watchdog settles the task at the budget (reason 'cost'). No default — unset means no cost budget." })),
+					output_schema: Type.Optional(
+						Type.Object({}, {
+							description:
+								"Optional typed-harvest contract — a JSON Schema the worker's vitrine_done `data` payload must satisfy. " +
+								"When declared, the payload is required and validated at the call; the data is recorded to result.json and " +
+								"rendered (capped) in the harvest report.",
+						}),
+					),
 				}),
 				{ minItems: 1, maxItems: 8, description: "1–8 tasks per invocation; overflow queues within the call." },
 			),

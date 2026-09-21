@@ -227,9 +227,10 @@ describe("createTask and spec round-trip", () => {
 		expect(await P.readSpec(join(root, id))).toEqual(spec);
 	});
 
-	it("round-trips the full field set (headless, attended, max_cost_usd, from_task_id)", async () => {
+	it("round-trips the full field set (headless, attended, max_cost_usd, from_task_id, output_schema)", async () => {
 		const id = P.newTaskId();
-		const spec = { ...makeSpec(id), mode: "headless" as const, attended: true, max_cost_usd: 1.5, from_task_id: P.newTaskId() };
+		const outputSchema = { type: "object", properties: { verdict: { type: "string" } }, required: ["verdict"] };
+		const spec = { ...makeSpec(id), mode: "headless" as const, attended: true, max_cost_usd: 1.5, from_task_id: P.newTaskId(), output_schema: outputSchema };
 		await P.createTask(join(root, id), spec, PROMPT.replace("<id>", id));
 		expect(await P.readSpec(join(root, id))).toEqual(spec);
 	});
@@ -250,6 +251,9 @@ describe("createTask and spec round-trip", () => {
 			["wall_timeout_s zero", (s) => (s.wall_timeout_s = 0)],
 			["auto_settle_grace_s negative", (s) => (s.auto_settle_grace_s = -5)],
 			["max_cost_usd string", (s) => (s.max_cost_usd = "x")],
+			["output_schema array", (s) => (s.output_schema = [1, 2])],
+			["output_schema string", (s) => (s.output_schema = "x")],
+			["output_schema null", (s) => (s.output_schema = null)],
 			["from_task_id not uuid", (s) => (s.from_task_id = "abc")],
 			["boot_id missing", (s) => delete s.boot_id],
 			["agent.tools not strings", (s) => (s.agent = { name: "r", tools: [1] })],

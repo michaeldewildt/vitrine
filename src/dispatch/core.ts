@@ -48,6 +48,8 @@ export interface DispatchTaskInput {
 	inactivity?: number;
 	/** Optional — max total session cost (USD); the watchdog settles the task at the budget (reason `cost`). No default — unset means no cost budget. */
 	max_cost_usd?: number;
+	/** Optional — the typed-harvest contract: a JSON Schema (a plain object) the worker's `vitrine_done` `data` payload must satisfy. Rides spec.json; validated at the call (fail-fast). No default — unset means no typed contract (a `data` payload, if any, is recorded unvalidated). */
+	output_schema?: Record<string, unknown>;
 }
 
 /** The dispatcher's self-knowledge (probed: sessionManager + ctx fields). */
@@ -126,6 +128,12 @@ export interface DispatchedTaskResult {
 	partial?: boolean;
 	/** The 0600 overflow file (the capped result names it). */
 	overflowFile?: string;
+	/** The typed data (the worker's `vitrine_done` `data`, the parsed `result.json`) — machine-readable, uncapped. */
+	data?: unknown;
+	/** The data for the report (compact JSON, 8 KB-capped; the capped text names its overflow file). */
+	dataText?: string;
+	/** The 0600 overflow file for the capped data. */
+	overflowDataFile?: string;
 	/** True when this call queued the item and it ran after a slot freed. */
 	queuedThisCall?: boolean;
 	/** True when adopted (live at admission, not dispatched this call). */
@@ -198,6 +206,9 @@ export async function dispatchTasks(opts: DispatchOptions): Promise<DispatchRepo
 		if (t.timeout !== undefined && (typeof t.timeout !== "number" || t.timeout <= 0)) throw new DispatchError("bad-input", "'timeout' must be a positive number of seconds");
 		if (t.inactivity !== undefined && (typeof t.inactivity !== "number" || t.inactivity <= 0)) throw new DispatchError("bad-input", "'inactivity' must be a positive number of seconds");
 		if (t.max_cost_usd !== undefined && (typeof t.max_cost_usd !== "number" || t.max_cost_usd <= 0)) throw new DispatchError("bad-input", "'max_cost_usd' must be a positive number of USD");
+		if (t.output_schema !== undefined && (typeof t.output_schema !== "object" || t.output_schema === null || Array.isArray(t.output_schema))) {
+			throw new DispatchError("bad-input", "'output_schema' must be a plain object (a JSON Schema)");
+		}
 	}
 
 	const cfg = C.readConfigSync();
@@ -363,6 +374,7 @@ export async function dispatchTasks(opts: DispatchOptions): Promise<DispatchRepo
 			wall_timeout_s: wallTimeoutS,
 			inactivity_s: inactivityS,
 			max_cost_usd: maxCostUsd,
+			output_schema: input.output_schema,
 			auto_settle_s: cfg.auto_settle_s,
 			auto_settle_grace_s: cfg.auto_settle_grace_s,
 			completed_close_s: cfg.completed_close_s,
@@ -547,6 +559,9 @@ export async function dispatchTasks(opts: DispatchOptions): Promise<DispatchRepo
 			result: h?.text,
 			partial: h?.partial || undefined,
 			overflowFile: h?.overflowFile,
+			data: h?.data,
+			dataText: h?.dataText,
+			overflowDataFile: h?.overflowDataFile,
 			queuedThisCall: p.queuedThisCall || undefined,
 			neverSpawned: reason === "never-spawned" ? true : undefined,
 			sessionId: p.spec.session_id,
@@ -575,6 +590,9 @@ export async function dispatchTasks(opts: DispatchOptions): Promise<DispatchRepo
 			result: h.text,
 			partial: h.partial || undefined,
 			overflowFile: h.overflowFile,
+			data: h.data,
+			dataText: h.dataText,
+			overflowDataFile: h.overflowDataFile,
 			sessionId: a.sessionId,
 			adopted: true,
 		});
@@ -597,6 +615,9 @@ export async function dispatchTasks(opts: DispatchOptions): Promise<DispatchRepo
 			result: h.text,
 			partial: h.partial || undefined,
 			overflowFile: h.overflowFile,
+			data: h.data,
+			dataText: h.dataText,
+			overflowDataFile: h.overflowDataFile,
 			sessionId: f.sessionId,
 			adopted: true,
 		});
@@ -640,6 +661,12 @@ export function renderReport(r: RenderReport): string {
 		out.push(head);
 		const body = res.result !== undefined ? res.result : res.state === "completed" ? "(no result content)" : "(not harvested)";
 		for (const line of body.split("\n")) out.push(line === "" ? "    " : `    ${line}`);
+		// the data block (the typed harvest) — after the answer, before the session line
+		if (res.dataText !== undefined) {
+			res.dataText.split("\n").forEach((line, i) => {
+				out.push(line === "" ? "    " : `    ${i === 0 ? "data: " : ""}${line}`);
+			});
+		}
 		out.push(`    session ${res.sessionId}`);
 	});
 	if (r.deferred.length > 0) {

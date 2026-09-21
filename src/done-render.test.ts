@@ -171,6 +171,28 @@ describe("renderResult (the result slot shows the answer as markdown)", () => {
 			, EXPANDED, theme);
 			expect((collapsed as StubComponent).render(80)).toEqual((expanded as StubComponent).render(80));
 		});
+		it("dataRecorded: a one-line note between the header and the answer (no note when unset)", () => {
+			const { deps }
+			= makeStubs();
+			const { renderResult }
+			= makeDoneRenderers(deps);
+			const withData = renderResult({ content: []
+			, details: { answer: "the answer", dataRecorded: true } }
+			, NOT_EXPANDED, theme) as StubComponent;
+			expect(withData.kind).toBe("container");
+			expect(withData.children).toHaveLength(3);
+			expect(withData.children![1]
+			.kind).toBe("text");
+			expect(withData.children![1]
+			.text).toBe("✓ data recorded (result.json)");
+			expect(withData.children![2]
+			.kind).toBe("markdown");
+			// unset: the note is absent — the no-data shape is unchanged
+			const without = renderResult({ content: []
+			, details: { answer: "the answer" } }
+			, NOT_EXPANDED, theme) as StubComponent;
+			expect(without.children).toHaveLength(2);
+		});
 
 	});
 

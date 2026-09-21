@@ -46,6 +46,8 @@ export interface TaskSpec {
 	/** Auto-close for completed tiles, seconds (default 600). 0 = never; optional — the wrapper falls back to 600 when absent. */
 	completed_close_s?: number;
 	max_cost_usd?: number;
+	/** The typed-harvest contract — a JSON Schema (plain object) the worker's `vitrine_done` `data` payload must satisfy. Rides spec.json; the worker validates the payload at the call and records it to `result.json` (the prose answer in `result.md` and the typed data stay orthogonal). */
+	output_schema?: Record<string, unknown>;
 	from_task_id?: string;
 	/** Raw session file to fork — `context` tasks fork the dispatcher's own live session file, which lives in no task dir. Mutually exclusive with `from_task_id`. */
 	from_session_file?: string;
@@ -69,6 +71,7 @@ const nonEmpty = (v: unknown): boolean => typeof v === "string" && v !== "";
 const absPath: Pred = (v) => typeof v === "string" && isAbsolute(v);
 const uuid: Pred = (v) => typeof v === "string" && UUID_RE.test(v);
 const posNum: Pred = (v) => typeof v === "number" && v > 0;
+const plainObject: Pred = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
 const posInt: Pred = (v) => typeof v === "number" && Number.isInteger(v) && v > 0;
 const nonNegInt: Pred = (v) => typeof v === "number" && Number.isInteger(v) && v >= 0;
 const isoTs: Pred = (v) => typeof v === "string" && !Number.isNaN(Date.parse(v));
@@ -88,6 +91,7 @@ const SPEC_FIELDS: FieldDef[] = [
 	{ key: "auto_settle_grace_s", msg: "auto_settle_grace_s must be a positive number", pred: posNum },
 	{ key: "completed_close_s", msg: "completed_close_s must be a non-negative integer (0 = never auto-close)", pred: nonNegInt, optional: true },
 	{ key: "max_cost_usd", msg: "max_cost_usd must be a positive number", pred: posNum, optional: true },
+	{ key: "output_schema", msg: "output_schema must be a plain object (a JSON Schema)", pred: plainObject, optional: true },
 	{ key: "from_task_id", msg: "from_task_id must be a lowercase uuidv4", pred: uuid, optional: true },
 	{ key: "from_session_file", msg: "from_session_file must be a non-empty string", pred: nonEmpty, optional: true },
 	{ key: "created_at", msg: "created_at must be an ISO timestamp", pred: isoTs },

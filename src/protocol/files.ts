@@ -71,6 +71,17 @@ export async function writeResult(dir: string, text: string): Promise<void> {
 	await atomicWriteFile(join(d, "result.md"), text);
 }
 
+/**
+ * Write `result.json` — the typed data payload (`vitrine_done`'s `data`
+ * parameter, validated at the call against the task's `output_schema`).
+ * Sibling of `writeResult`: the prose answer (`result.md`) and the typed
+ * contract (`result.json`) stay orthogonal.
+ */
+export async function writeResultJson(dir: string, data: unknown): Promise<void> {
+	const d = await assertTaskDir(dir);
+	await atomicWriteFile(join(d, "result.json"), `${JSON.stringify(data, null, 2)}\n`);
+}
+
 export interface DoneMarker {
 	ts: string;
 	/** `headless-exit` — the wrapper's own marker for a clean `--print` exit: headless completion is the process exit, made durable so ordering rule 1/2 see a marker for a genuinely-finished task. */

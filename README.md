@@ -23,6 +23,10 @@ The repo also ships the pieces that are not pi code: the `vitrine-run` wrapper (
 
 It is deliberately not a fork, shim, or drop-in of the old subagent tooling (`@mjakl/pi-subagent`): the contrast is visibility, not return — work is no longer an invisible subprocess piped into the parent's context; it is a place you can go, and its answer still lands in the tool result.
 
+## Typed harvest
+
+A dispatch can declare a typed contract: an `output_schema` (a JSON Schema) on the task. The schema rides `spec.json`, and the worker's `vitrine_done` gains an optional `data` parameter (arbitrary JSON) written to `result.json` (0600, alongside `result.md` — the prose answer and the typed contract stay orthogonal). When a schema was declared, `data` is required and validated at the `vitrine_done` call — fail-fast: a missing payload or a violating one errors with the offending fields named, so the worker retries with a fixed payload, and a schema that fails to compile fails closed. On harvest, the report renders the data as compact JSON after the answer block, capped at 8 KB with the full data preserved in a 0600 overflow file the capped text names (the same treatment as the text harvest); the per-task result carries the parsed data uncapped.
+
 ## Pi's principles
 
 pi ships none of the usual machinery — no sub-agents, no plan mode, no built-in to-dos, no background bash — and its answer to each is *build it yourself*, usually with tmux (https://pi.dev/). Vitrine is that escape hatch executed with the OS instead of tmux:

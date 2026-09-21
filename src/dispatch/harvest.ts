@@ -23,6 +23,9 @@ import { lastAssistantText } from "../session";
 export const CAP_BYTES_DEFAULT = 50 * 1024;
 export const CAP_LINES_DEFAULT = 2000;
 
+/** The typed-data render cap, bytes (the report's compact JSON). */
+export const CAP_DATA_BYTES = 8 * 1024;
+
 // ---------------------------------------------------------------------------
 // the deferred-harvest registry
 
@@ -56,6 +59,12 @@ export interface Harvest {
 	overflowFile?: string;
 	/** True when the task dir vanished mid-call (a concurrent `vitrine gc`). */
 	gone: boolean;
+	/** The typed data (the parsed `result.json` — the worker's `vitrine_done` `data`) — machine-readable, uncapped. */
+	data?: unknown;
+	/** The data for the report (compact JSON, capped; the capped text names its overflow file). */
+	dataText?: string;
+	/** The 0600 overflow file for the capped data (the capped text names it). */
+	overflowDataFile?: string;
 }
 
 /**
@@ -107,14 +116,53 @@ export async function harvestTask(
 				text = (await readFile(join(d, "tail.log"), "utf8").catch(() => null)) ?? null;
 			}
 		}
-		if (text === null) return { text: `(no harvestable content — ${source} absent)`, partial, gone: false };
-		return capText(text, { maxBytes, maxLines, tmpDir, id: P.taskIdOf(d), partial, source });
+		const base: Harvest =
+			text === null
+				? { text: `(no harvestable content — ${source} absent)`, partial, gone: false }
+				: capText(text, { maxBytes, maxLines, tmpDir, id: P.taskIdOf(d), partial, source });
+		// The typed data (`result.json` — `vitrine_done`'s `data`, written after
+		// the prose answer): harvested alongside it, orthogonal to the text chain.
+		const dataRaw = await readFile(join(d, "result.json"), "utf8").catch((e: NodeJS.ErrnoException) => (e.code === "ENOENT" ? null : Promise.reject(e)));
+		if (dataRaw === null) return base;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(dataRaw);
+		} catch {
+			// a corrupt result.json does not sink the prose harvest
+			return base;
+		}
+		const data = capData(parsed, { tmpDir, id: P.taskIdOf(d) });
+		return { ...base, data: parsed, dataText: data.text, overflowDataFile: data.overflowFile };
 	} catch (e: unknown) {
 		if (e instanceof P.ProtocolError && (e.code === "bad-path" || e.code === "no-spec")) {
 			return { text: "(task dir vanished mid-call — a concurrent `vitrine gc`?)", partial, gone: true };
 		}
 		throw e;
 	}
+}
+
+/**
+ * Cap a data render (the report's compact JSON) at CAP_DATA_BYTES. The same
+ * overflow treatment as `capText`: a 0600 temp file holds the full data and
+ * the (capped) text names it.
+ */
+function capData(data: unknown, opts: { tmpDir: string; id: string }): { text: string; overflowFile?: string } {
+	const full = JSON.stringify(data);
+	if (Buffer.byteLength(full, "utf8") <= CAP_DATA_BYTES) return { text: full };
+	const enc = new TextEncoder();
+	let lo = 0;
+	let hi = full.length;
+	// binary search the prefix that fits CAP_DATA_BYTES (same as capText)
+	while (lo < hi) {
+		const mid = (lo + hi + 1) >> 1;
+		if (enc.encode(full.slice(0, mid)).length <= CAP_DATA_BYTES) lo = mid;
+		else hi = mid - 1;
+	}
+	const suffix = `\n… [data capped: ${Buffer.byteLength(full, "utf8")} bytes total; full data below]`;
+	const tmp = join(opts.tmpDir, `vitrine-${opts.id}-data-${randomUUID().slice(0, 8)}.json`);
+	mkdirSync(opts.tmpDir, { recursive: true });
+	writeFileSync(tmp, full, { mode: 0o600 });
+	return { text: full.slice(0, lo) + suffix + `\nfull data: ${tmp}`, overflowFile: tmp };
 }
 
 /** Parse a session JSONL leniently (a torn last line on a live file is normal). */

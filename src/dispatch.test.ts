@@ -904,6 +904,31 @@ describe("admission + in-call queue (2+2, work-conserving)", () => {
 		}
 	}, 60_000);
 
+	it("output_schema: the declared schema rides spec.json (typed harvest); a non-object is a bad-input", async () => {
+		const schema = { type: "object", properties: { verdict: { type: "string" } }, required: ["verdict"] };
+		const r = await dispatchTasks({
+			tasks: [{ agent: "test-agent", task: "schema ride", output_schema: schema }],
+			mode: "headless",
+			dispatcher: info(),
+			bunBin,
+			deps: deps(),
+		});
+		expect(r.results[0].state).toBe("completed");
+		expect((await P.readSpec(join(tasksRoot, r.results[0].id))).output_schema).toEqual(schema);
+		// the fixture worker records no data — the harvest carries none
+		expect(r.results[0].data).toBeUndefined();
+		// a non-object schema is a bad-input (rejected before any task dir exists)
+		await expect(
+			dispatchTasks({
+				tasks: [{ agent: "test-agent", task: "bad schema", output_schema: [1] as unknown as Record<string, unknown> }],
+				mode: "headless",
+				dispatcher: info(),
+				bunBin,
+				deps: deps(),
+			}),
+		).rejects.toMatchObject({ code: "bad-input" });
+	}, 60_000);
+
 	it("2 + in-call queue across a foreign running task; the foreign task is adopted", async () => {
 		const foreign = await spawnForeignRunning(3500);
 		try {
@@ -1157,6 +1182,29 @@ describe("harvest (caps + 0600 overflow)", () => {
 		expect(await readFile(h.overflowFile!, "utf8")).toBe(full);
 	});
 
+	it("result.json: the typed data is harvested (machine-readable + compact JSON for the report)", async () => {
+		const data = { verdict: "pass", port: 8080 };
+		const dir = await terminalTaskDir({ "result.md": "the answer\n", "result.json": JSON.stringify(data, null, 2) + "\n" });
+		const h = await harvestTask(dir, "completed", { tmpDir: join(base, "tmp") });
+		expect(h.data).toEqual(data);
+		expect(h.dataText).toBe(JSON.stringify(data));
+		expect(h.overflowDataFile).toBeUndefined();
+	});
+
+	it("a >8KB result.json is capped, with the full data in a 0600 overflow file", async () => {
+		const data = { big: "x".repeat(9000), keep: "it" };
+		const full = JSON.stringify(data);
+		const dir = await terminalTaskDir({ "result.md": "the answer\n", "result.json": full + "\n" });
+		const h = await harvestTask(dir, "completed", { tmpDir: join(base, "tmp") });
+		expect(h.data).toEqual(data); // machine-readable stays uncapped
+		expect(h.dataText).toContain("[data capped");
+		expect(h.dataText).toContain(h.overflowDataFile!);
+		expect(h.dataText!.length).toBeLessThan(full.length);
+		const st = statSync(h.overflowDataFile!);
+		expect(st.mode & 0o777).toBe(0o600);
+		expect(await readFile(h.overflowDataFile!, "utf8")).toBe(full);
+	});
+
 	it("falls back to the session's last assistant text when result.md is absent", async () => {
 		const id = P.newTaskId();
 		const dir = join(tasksRoot, id);
@@ -1192,7 +1240,7 @@ describe("harvest (caps + 0600 overflow)", () => {
 
 describe("result format (the shape)", () => {
 	const res: DispatchedTaskResult[] = [
-		{ id: "a1b2c3d4-0000-0000-0000-000000000001", agent: "refiner", state: "completed", elapsedMs: 252_000, result: "the verdict\nsecond line", sessionId: "vitrine.a1b2c3d4-0000-0000-0000-000000000001" },
+		{ id: "a1b2c3d4-0000-0000-0000-000000000001", agent: "refiner", state: "completed", elapsedMs: 252_000, result: "the verdict\nsecond line", data: { verdict: "pass" }, dataText: '{"verdict":"pass"}', sessionId: "vitrine.a1b2c3d4-0000-0000-0000-000000000001" },
 		{ id: "a1b2c3d4-0000-0000-0000-000000000002", agent: "executor", state: "crashed", reason: "never-spawned", elapsedMs: 4_000, result: "partial work", partial: true, sessionId: "vitrine.a1b2c3d4-0000-0000-0000-000000000002", queuedThisCall: true },
 	];
 	const text = renderReport({ mode: "tile", dispatched: 2, results: res, queuedThisCall: 1, adopted: [], deferred: [], aborted: false });
@@ -1209,6 +1257,13 @@ describe("result format (the shape)", () => {
 
 	it("crashed tasks are labelled partial and named with the reason", () => {
 		expect(text).toContain("[2] executor · a1b2c3d4 — crashed (4s) (never-spawned) — partial");
+	});
+
+	it("the data block (the typed harvest) renders after the answer block, before the session line", () => {
+		const lines = text.split("\n");
+		const bodyIdx = lines.findIndex((l) => l === "    second line");
+		expect(lines[bodyIdx + 1]).toBe('    data: {"verdict":"pass"}');
+		expect(lines[bodyIdx + 2]).toBe("    session vitrine.a1b2c3d4-0000-0000-0000-000000000001");
 	});
 
 	it("the queued-this-call line", () => {
