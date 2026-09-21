@@ -91,7 +91,7 @@ export interface CollectResult {
 	rows: CollectRow[];
 	/** The fixed wrapper over the terminal tasks this collect harvested (null when it harvested none). */
 	message: HarvestMessage | null;
-	/** The collect's fresh delivery-batch id (the marker's `id` when this collect wrote it; the message's batch id) — null when nothing was harvested. */
+	/** The collect's delivery-batch id (the marker's `id` when this collect wrote it; the message's batch id) — anchored to the FIRST existing marker id in the harvested batch when every task was already delivered (a message's membership is reconstructable from disk — details.batch is a batch id some marker carries, never an orphan UUID), and a fresh collect-scoped id when nothing was marked. Null when nothing was harvested. */
 	batch: string | null;
 	/** The headlined undelivered attended tasks (the no-id scope only — headline, not body). */
 	headlined: CollectHeadline[];
@@ -156,16 +156,24 @@ export async function collectTasks(opts: CollectOptions): Promise<CollectResult>
 
 	const rows: CollectRow[] = [];
 	const bodies: DeliveryTask[] = [];
-	let batch: string | null = null;
+	// The batch id (R6's write semantics + the reconstructability invariant):
+	// the collect's message is ONE delivery batch — every task it marks gets
+	// the SAME id. When the batch re-shows already-delivered tasks, the id
+	// anchors to the FIRST existing marker in the batch (scan order): a
+	// message's membership is reconstructable from disk, and an orphan UUID
+	// no marker carries would break it. A fresh UUID is minted only when
+	// nothing was marked yet.
+	let batch: string | null = terminalSet.map((f) => f.delivered).find((d): d is string => d !== null) ?? null;
 
 	for (const f of terminalSet) {
-		const st = await P.readState(f.dir).catch(() => null);
-		const el = st !== null ? elapsedOf(st, f.spec) : undefined;
+		const state = await P.readState(f.dir).catch(() => null);
+		const el = state !== null ? elapsedOf(state, f.spec) : undefined;
 		const h = await harvestTask(f.dir, f.state, { tmpDir });
 		// The write semantics (R6): a collect that harvests a terminal task
-		// writes `harvest-delivered` — a fresh collect-scoped batch id (the
-		// marker is write-once; a concurrent delivery winning the race between
-		// the scan and the write is reported with the winner's id).
+		// writes `harvest-delivered` — under the batch id anchored above (a
+		// fresh collect-scoped id when nothing was marked; the marker is
+		// write-once, so a concurrent delivery winning the race between the
+		// scan and the write is reported with the winner's id).
 		let delivered = f.delivered;
 		let markedNow: string | undefined;
 		if (delivered === null) {
@@ -191,7 +199,7 @@ export async function collectTasks(opts: CollectOptions): Promise<CollectResult>
 			replay: false,
 			...(f.reason !== undefined && f.reason !== "" ? { reason: f.reason } : {}),
 			...(el !== undefined ? { elapsed: el } : {}),
-			...(st !== null && st.finished_at !== undefined ? { settledAt: st.finished_at } : {}),
+			...(state !== null && state.finished_at !== undefined ? { settledAt: state.finished_at } : {}),
 		};
 		if (f.state !== "killed") {
 			body.text = h.text;

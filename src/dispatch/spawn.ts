@@ -88,6 +88,16 @@ export interface SpawnTarget {
  * was issued: a code-1 hyprctl is a failed issue, not a throw — the
  * `spawn-failed` event marks the throw/catch path only (e.g. a broken
  * run-path resolution), `failed-to-spawn` the settle.
+ *
+ * The `spawn-issued` event is written BEFORE the spawn issues: the event is
+ * the double-spawn guard for a concurrently-attaching wait loop, and the
+ * issue window is real (the tile join's map-wait runs 1–2 s) — a loop
+ * attaching mid-issue must see the guard, not a bare `queued` state with no
+ * record. A failed issue then settles failed-to-spawn, so the stale event
+ * is inert: a settled task is terminal, and the guard only reads `queued`
+ * tasks. If the event itself cannot be written, the guard cannot be claimed
+ * — fail conservative (no spawn, settle failed-to-spawn): a silently
+ * dropped guard risks a double spawn for the whole boot window.
  */
 export async function issueSpawn(target: SpawnTarget, env: SpawnEnv): Promise<boolean> {
 	const doSpawn = async (): Promise<boolean> => {
@@ -118,18 +128,20 @@ export async function issueSpawn(target: SpawnTarget, env: SpawnEnv): Promise<bo
 			return false;
 		}
 	};
+	// The spawn-issued record BEFORE the issue (the double-spawn guard — see
+	// the module comment above). A failed append fails the spawn conservative.
+	const guarded = await P.appendEvent(target.dir, { event: "spawn-issued", source: "dispatch" }).then(() => true).catch(() => false);
+	if (!guarded) {
+		await P.transitionState(target.dir, "queued", "crashed", {}, "failed-to-spawn").catch(() => null);
+		await P.appendEvent(target.dir, { event: "spawn-guard-write-failed", source: "dispatch" }).catch(() => null);
+		return false;
+	}
 	const ok = await doSpawn();
-	if (ok) {
-		// The spawn-issued record (disk is the source of truth): a spawn is in
-		// flight — the wrapper flips queued→running on its own first tick, so
-		// a wait loop that attaches within the wrapper's boot window sees the
-		// state still `queued`. This event is what keeps it from re-spawning
-		// an in-flight spawn (a spawn-issued older than the stuck window is a
-		// dead spawner — the loop re-spawns then).
-		await P.appendEvent(target.dir, { event: "spawn-issued", source: "dispatch" }).catch(() => null);
-	} else {
+	if (!ok) {
 		// A failed read of the state (the dir vanished) keeps the settle as a
-		// no-op — the event still records the failure.
+		// no-op — the event still records the failure. The (now pre-issue)
+		// spawn-issued event stays in the log: inert — the task is terminal
+		// and the guard only applies to queued tasks.
 		await P.transitionState(target.dir, "queued", "crashed", {}, "failed-to-spawn").catch(() => null);
 		await P.appendEvent(target.dir, { event: "failed-to-spawn", source: "dispatch" });
 	}

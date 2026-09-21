@@ -118,7 +118,8 @@ interface RegisteredTool {
 	) => { render(w: number): string[] };
 }
 
-function fakePi(activeTools: string[] = [], opts: { coOwner?: boolean } = {}) {
+function fakePi(activeTools: string[] = [], opts: { coOwnerTools?: string[] } = {}) {
+	const coOwned = new Set(opts.coOwnerTools ?? []);
 	const tools: RegisteredTool[] = [];
 	const sessionStart: Array<(event: unknown, ctx: unknown) => unknown> = [];
 	const sessionShutdown: Array<(event: unknown, ctx: unknown) => unknown> = [];
@@ -141,7 +142,11 @@ function fakePi(activeTools: string[] = [], opts: { coOwner?: boolean } = {}) {
 					// pi's tool map is name-keyed (last-loaded wins): the single
 					// entry's sourceInfo.path is whoever currently owns the name
 					// — this file when free, the co-owner's file when contested
-					sourceInfo: { path: opts.coOwner ? coOwnerPath : ownEntryPath },
+					sourceInfo: { path: coOwned.has("vitrine_dispatch") ? coOwnerPath : ownEntryPath },
+				},
+				{
+					name: "vitrine_collect",
+					sourceInfo: { path: coOwned.has("vitrine_collect") ? coOwnerPath : ownEntryPath },
 				},
 			],
 		setActiveTools: (names: string[]) => {
@@ -555,7 +560,7 @@ describe("dispatcher mode (cutover + the dispatch tool)", () => {
 			errLines.push(String(chunk));
 			return true;
 		}) as typeof process.stderr.write;
-		const fake = fakePi([], { coOwner: true });
+		const fake = fakePi(["vitrine_dispatch", "vitrine_collect"], { coOwnerTools: ["vitrine_dispatch"] });
 		try {
 			vitrine(fake.api);
 			// registration still happens at load (a registration cannot be
@@ -567,6 +572,31 @@ describe("dispatcher mode (cutover + the dispatch tool)", () => {
 		}
 		expect(fake.setActiveToolsCalls).toHaveLength(1);
 		expect(fake.setActiveToolsCalls[0]).not.toContain("vitrine_dispatch");
+		expect(fake.setActiveToolsCalls[0]).toContain("vitrine_collect"); // only the contested name is deactivated
+		expect(errLines.join("")).toContain("cutover rule");
+	});
+
+	it("the cutover rule covers vitrine_collect too: a later-loaded owner shadows it (deactivated + warned)", () => {
+		delete process.env.VITRINE_TASK_DIR;
+		const errLines: string[] = [];
+		const origErr = process.stderr.write;
+		process.stderr.write = ((chunk: unknown) => {
+			errLines.push(String(chunk));
+			return true;
+		}) as typeof process.stderr.write;
+		// pi's name-keyed map is last-loaded wins: a later-loaded extension can
+		// shadow EITHER dispatcher-side name — the guard checks both
+		const fake = fakePi(["vitrine_dispatch", "vitrine_collect"], { coOwnerTools: ["vitrine_collect"] });
+		try {
+			vitrine(fake.api);
+			fake.fire();
+		} finally {
+			process.stderr.write = origErr;
+		}
+		expect(fake.setActiveToolsCalls).toHaveLength(1);
+		expect(fake.setActiveToolsCalls[0]).not.toContain("vitrine_collect");
+		expect(fake.setActiveToolsCalls[0]).toContain("vitrine_dispatch"); // the free name keeps our registration
+		expect(errLines.join("")).toContain("vitrine_collect");
 		expect(errLines.join("")).toContain("cutover rule");
 	});
 
@@ -588,7 +618,6 @@ describe("dispatcher mode (cutover + the dispatch tool)", () => {
 			const { api, tools } = fake;
 			vitrine(api);
 			const progress: string[] = [];
-			const started = Date.now();
 			const out = await tools[0].execute!(
 				"call1",
 				{ tasks: [{ agent: "test-agent", task: "say hi" }] },
@@ -596,11 +625,11 @@ describe("dispatcher mode (cutover + the dispatch tool)", () => {
 				(u) => progress.push(u.content.map((c) => c.text).join("\n")),
 				fakeCtx(),
 			);
+			const returnedAt = Date.now();
 			const text = out.content.map((c) => c.text).join("\n");
 			// The R1 contract: the tool returns after the spawn pass — long
 			// before the worker settles (the fixture takes ~1 s) — and it
 			// carries no harvest and streams no progress
-			expect(Date.now() - started).toBeLessThan(2000);
 			expect(text).toContain("1 dispatched (non-blocking — each task's harvest will be reported on settlement, not in this result)");
 			expect(text).toContain("the harvest will be reported on settlement");
 			expect(progress.length).toBe(0);
@@ -625,6 +654,13 @@ describe("dispatcher mode (cutover + the dispatch tool)", () => {
 				deps: { tickMs: 150 },
 			});
 			expect(w.states[0].state).toBe("completed");
+			// R11 (the strong timing assertion): the tool returned BEFORE the
+			// settlement — the fixture settles ~1 s after the spawn pass, so a
+			// reintroduced in-call wait would not return before `finished_at`
+			// (a fixed wall-clock bound can't tell the two apart).
+			const settled = await P.readState(dir!);
+			expect(settled.finished_at).toBeDefined();
+			expect(returnedAt).toBeLessThan(Date.parse(settled.finished_at!));
 			const onDisk = await readFile(join(dir!, "result.md"), "utf8").catch(() => "");
 			expect(onDisk).toContain("fixture finished the work");
 			expect(text).not.toContain("fixture finished the work"); // the harvest never lands in the tool result
@@ -703,6 +739,62 @@ describe("dispatcher mode (cutover + the dispatch tool)", () => {
 			fake.fireShutdown();
 			await new Promise((r) => setTimeout(r, 1200));
 			expect(fake.sentMessages).toHaveLength(1);
+		} finally {
+			process.env.VITRINE_TASKS_ROOT = realRoot;
+		}
+	}, 30_000);
+
+	it("E2E (wiring): a FORKED session_start replays the pre-fork undelivered settlement (coalesced replay: message)", async () => {
+		delete process.env.VITRINE_TASK_DIR;
+		const realRoot = process.env.VITRINE_TASKS_ROOT;
+		const forkRoot = join(base, "fork-tasks");
+		await mkdir(forkRoot, { recursive: true });
+		process.env.VITRINE_TASKS_ROOT = forkRoot;
+		try {
+			const fake = fakePi();
+			vitrine(fake.api);
+			// the pre-fork dispatcher's session id (the previous file's header id)
+			const preForkId = P.newTaskId();
+			const preForkFile = join(sessionsRoot, `fork-pre-${preForkId.slice(0, 8)}.jsonl`);
+			const hdr: Record<string, unknown> = { type: "session", version: 3, id: preForkId, timestamp: new Date().toISOString(), cwd: base };
+			await writeFile(preForkFile, JSON.stringify(hdr) + "\n");
+			// a completed, undelivered async task dispatched BY the pre-fork session
+			const id = P.newTaskId();
+			const dir = join(forkRoot, id);
+			const spec: P.TaskSpec = {
+				task_id: id,
+				agent: { name: "test-agent", body: "body\n" },
+				dispatcher_session_id: preForkId,
+				cwd: base,
+				session_id: `vitrine.${id}`,
+				session_name: `test-agent · ${id.slice(0, 8)}`,
+				mode: "headless",
+				attended: false,
+				workspace: 9,
+				wall_timeout_s: 3600,
+				inactivity_s: 600,
+				auto_settle_s: 600,
+				auto_settle_grace_s: 60,
+				async: true,
+				created_at: new Date().toISOString(),
+				boot_id: P.currentBootId(),
+			};
+			await P.createTask(dir, spec, "fork replay prompt\n");
+			await P.transitionState(dir, "queued", "running", { started_at: new Date(Date.now() - 42_000).toISOString() });
+			await writeFile(join(dir, "result.md"), "the pre-fork answer\n");
+			await P.transitionState(dir, "running", "completed", { finished_at: new Date().toISOString() });
+			// the FORKED session start (previousSessionFile → the ancestry + the replay arm)
+			await fake.fire({ reason: "fork", previousSessionFile: preForkFile });
+			// the replay is the arm's OWN message (immediately at arm) — lands well inside the wait
+			await new Promise((r) => setTimeout(r, 2500));
+			expect(fake.sentMessages).toHaveLength(1);
+			const { message, options } = fake.sentMessages[0] as { message: { customType: string; content: string; details: { replay: boolean; batch: string } }; options: Record<string, unknown> };
+			expect(message.customType).toBe("vitrine-harvest");
+			expect(message.content).toContain("the pre-fork answer");
+			expect(message.content).toContain("replay: the session restarted"); // undelivered at session start
+			expect(message.details.replay).toBe(true);
+			expect(options).toEqual({ deliverAs: "followUp", triggerTurn: true });
+			expect(await P.harvestDeliveredId(dir)).toBe(message.details.batch); // the marker is written after the send
 		} finally {
 			process.env.VITRINE_TASKS_ROOT = realRoot;
 		}
@@ -816,6 +908,32 @@ describe("vitrine_collect (the pull floor + the fork ancestry)", () => {
 		expect(d).toContain("never busy-poll collect inside a turn");
 		expect(d).toContain("writes the harvest-delivered marker");
 		expect(d).toContain("headlined without a body");
+	});
+
+	/** Walk a typebox schema object for the first node with `type: "array"` (the Optional wrapper nests it under `anyOf`). */
+	const findArraySchema = (node: unknown): Record<string, unknown> | null => {
+		if (node === null || typeof node !== "object") return null;
+		const o = node as Record<string, unknown>;
+		if (o.type === "array") return o;
+		for (const v of Object.values(o)) {
+			const found = findArraySchema(v);
+			if (found !== null) return found;
+		}
+		return null;
+	};
+
+	it("the ids param enforces the 1–8 bound (maxItems, matching vitrine_dispatch's surface)", () => {
+		delete process.env.VITRINE_TASK_DIR;
+		const fake = fakePi();
+		vitrine(fake.api);
+		const collect = fake.tools.find((t) => t.name === "vitrine_collect");
+		expect(collect).toBeDefined();
+		const arr = findArraySchema(collect!.parameters);
+		expect(arr).not.toBeNull();
+		// the description says 1–8 — the schema must say so too (enforced, not just documented)
+		expect(arr!.minItems).toBe(1);
+		expect(arr!.maxItems).toBe(8);
+		expect(String(arr!.description ?? "")).toContain("1–8 task ids");
 	});
 
 	it("a fork's no-id collect finds the pre-fork task (the session_start fork ancestry)", async () => {

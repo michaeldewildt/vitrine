@@ -361,7 +361,9 @@ export default function vitrine(pi: ExtensionAPI): void {
 			// re-arm it when it had stopped (the stop condition applied after the
 			// previous work drained) — the dispatch guarantees its own batch is
 			// watched. No replay here: the context is live (a re-show would be a
-			// genuine duplicate, not a replay).
+			// genuine duplicate, not a replay). The re-arm's attach scan adopts
+			// only STALE-LEASE tasks (the dead-predecessor discriminator) — a
+			// live session's running tasks are never co-adopted by this re-arm.
 			armWatcher(dispatcher.sessionId, false);
 			// A plain-string result crashes pi's TUI and is dropped from the
 			// session record — return the ToolResult object (verified 2026-09-17).
@@ -389,7 +391,7 @@ export default function vitrine(pi: ExtensionAPI): void {
 							"Optional task ids (full ids, or the short 8-char prefix from the dispatch return) — they cross any session. " +
 							"Omitted: all tasks of this session plus its fork ancestry.",
 					}),
-					{ minItems: 1, description: "1–8 task ids; a short prefix must match exactly one task." },
+					{ minItems: 1, maxItems: 8, description: "1–8 task ids (matching vitrine_dispatch's bound); a short prefix must match exactly one task." },
 				),
 			),
 		}),
@@ -427,7 +429,9 @@ export default function vitrine(pi: ExtensionAPI): void {
 	// entry's sourceInfo.path differing from this file; an owner loaded
 	// before us was superseded by us and is undetectable (we own the name
 	// then — documented limitation). On a detected conflict we deactivate
-	// ours (a registration cannot be retracted) and warn.
+	// ours (a registration cannot be retracted) and warn. BOTH dispatcher-
+	// side tools are checked: a later-loaded extension can shadow either
+	// name.
 
 	// ---- The session-scoped watcher (R2/R3) ---------------------------------
 	// The session's long-lived poller: it owns what the blocking call used to
@@ -463,13 +467,16 @@ export default function vitrine(pi: ExtensionAPI): void {
 
 	const onSessionStart = async (event: unknown, ctx: unknown): Promise<void> => {
 		try {
-			const entry = pi.getAllTools().find((t) => t.name === DISPATCH_TOOL);
 			const ownPath = safeRealpath(fileURLToPath(import.meta.url));
-			const ownerPath = safeRealpath(entry?.sourceInfo?.path ?? "");
-			if (ownPath && ownerPath && ownerPath !== ownPath) {
-				pi.setActiveTools(pi.getActiveTools().filter((n) => n !== DISPATCH_TOOL));
+			const conflicting = [DISPATCH_TOOL, COLLECT_TOOL].filter((name) => {
+				const entry = pi.getAllTools().find((t) => t.name === name);
+				const ownerPath = safeRealpath(entry?.sourceInfo?.path ?? "");
+				return ownPath !== undefined && ownerPath !== undefined && ownerPath !== ownPath;
+			});
+			if (conflicting.length > 0) {
+				pi.setActiveTools(pi.getActiveTools().filter((n) => !conflicting.includes(n)));
 				process.stderr.write(
-					`vitrine: refusing to own ${DISPATCH_TOOL} — the name is owned by another extension (${ownerPath}; cutover rule); our registration is deactivated\n`,
+					`vitrine: refusing to own ${conflicting.join(", ")} — ${conflicting.length > 1 ? "the names are" : "the name is"} owned by another extension (cutover rule); our registration is deactivated\n`,
 				);
 			}
 		} catch {
@@ -507,8 +514,9 @@ export default function vitrine(pi: ExtensionAPI): void {
 	});
 }
 
-/** realpath with a fail-safe undefined — the guard is best-effort only. */
+/** realpath with a fail-safe undefined — the guard is best-effort only. An empty path is NOT real-able (realpathSync("")) yields the CWD — a missing entry must read as "no owner", not a conflict. */
 function safeRealpath(p: string): string | undefined {
+	if (p === "") return undefined;
 	try {
 		return realpathSync(p);
 	} catch {

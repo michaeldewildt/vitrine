@@ -255,6 +255,40 @@ describe("a collect of a terminal task writes harvest-delivered", () => {
 			root.restore();
 		}
 	});
+
+	it("a re-show (every harvested task already delivered) anchors details.batch to an existing marker id — reconstructable from disk, never an orphan UUID", async () => {
+		const root = freshRoot();
+		try {
+			const sid = "c-reshow";
+			const a = await settleCompleted(P.newTaskId(), "the A re-show\n", { dispatcher_session_id: sid });
+			const b = await settleCompleted(P.newTaskId(), "the B re-show\n", { dispatcher_session_id: sid });
+			const dirA = join(tasksRoot, a);
+			const dirB = join(tasksRoot, b);
+			const markerA = "aaaaaaa1-0000-4000-8000-00000000000a";
+			const markerB = "bbbbbbb2-0000-4000-8000-00000000000b";
+			await P.writeHarvestDelivered(dirA, markerA);
+			await P.writeHarvestDelivered(dirB, markerB);
+			const res = await collectTasks({ sessionId: sid });
+			// the batch is anchored to the FIRST existing marker in scan order
+			// (the sorted dir order) — a message's membership is reconstructable
+			// from disk: details.batch is a batch id some marker carries
+			const first = [dirA, dirB].sort()[0];
+			const expectedAnchor = first === dirA ? markerA : markerB;
+			expect(res.batch).toBe(expectedAnchor);
+			expect(res.message!.details.batch).toBe(expectedAnchor);
+			// the markers are untouched (write-once)
+			expect(await P.harvestDeliveredId(dirA)).toBe(markerA);
+			expect(await P.harvestDeliveredId(dirB)).toBe(markerB);
+			// the delivery status shows each task's own marker
+			expect(res.text).toContain(`${shortId(a)} already delivered (batch ${shortId(markerA)})`);
+			expect(res.text).toContain(`${shortId(b)} already delivered (batch ${shortId(markerB)})`);
+			// and the re-show still carries the harvests (the body is re-harvested)
+			expect(res.text).toContain("the A re-show");
+			expect(res.text).toContain("the B re-show");
+		} finally {
+			root.restore();
+		}
+	});
 });
 
 // ---------------------------------------------------------------------------

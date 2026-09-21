@@ -106,10 +106,17 @@ export interface WaitResult {
  * wall time (`appendEvent` is real), so this check does not follow the
  * injectable `now` (which tests use to fast-forward the protocol predicates
  * — lease/age — that key on timestamps the caller writes).
+ *
+ * CONSISTENT ON A MALFORMED/TORN READ: a torn last line (a read racing an
+ * append) or a corrupt events.jsonl is treated as IN-FLIGHT (no spawn) —
+ * the next tick re-reads; mapping a read failure to "not in flight" would
+ * silently drop the guard for the whole boot window and risk a double
+ * spawn. An ABSENT events.jsonl is not a torn read (readEvents returns [])
+ * — a just-created queued task with no events is genuinely not in flight.
  */
-async function spawnInFlight(dir: string): Promise<boolean> {
+export async function spawnInFlight(dir: string): Promise<boolean> {
 	const events = await P.readEvents(dir).catch(() => null);
-	if (events === null) return false;
+	if (events === null) return true; // the conservative read (see above)
 	for (let i = events.length - 1; i >= 0; i--) {
 		if (events[i].event !== "spawn-issued") continue;
 		const ts = Date.parse(String(events[i].ts));
@@ -190,10 +197,17 @@ export async function waitForTasks(opts: WaitOptions): Promise<WaitResult> {
 		const unspawned = owned.filter((o) => !o.spawnIssued && !P.isTerminal(o.seenState));
 		const unspawnedDirs = new Set(unspawned.map((o) => o.dir));
 		await reconcileAll(now(), unspawnedDirs);
-		// Refresh this loop's lease for the unspawned in-scope tasks — the
-		// claim that keeps a concurrent reconcile from settling them: a
-		// live owner ticks (and thus refreshes); a dead one stops.
-		for (const o of unspawned) {
+		// Refresh this loop's lease for EVERY non-terminal in-scope task —
+		// the live-owner claim. The stuck-queued gate reads it for the queue
+		// (a live owner ticks and thus refreshes; a dead one stops) and the
+		// watcher's arm adoption gate reads it for running tasks (a live
+		// predecessor's running task carries a fresh lease, so a concurrent
+		// session's re-arm never adopts it — the lease is the
+		// dead-predecessor discriminator). The reconcile exclusion stays
+		// the unspawned queue only (a running task must still reconcile: a
+		// dead wrapper settles rule 2).
+		for (const o of owned) {
+			if (P.isTerminal(o.seenState)) continue;
 			await P.writeLease(o.dir, { owner: opts.lease.owner, nonce: opts.lease.nonce, updated_at: new Date(now()).toISOString() }).catch(() => null);
 		}
 		let slots = countSlots(await nonTerminalTasks(new Set(unspawned.map((o) => o.id))), now());
