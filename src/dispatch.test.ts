@@ -875,6 +875,35 @@ describe("admission + in-call queue (2+2, work-conserving)", () => {
 		}
 	}, 60_000);
 
+	it("thinking chain: per-call > agent frontmatter > omitted (no flag)", async () => {
+		const thinker = join(base, ".pi", "agent", "agents", "thinker.md");
+		await writeFile(thinker, "---\nname: thinker\ndescription: fixture thinker agent\nthinking: medium\n---\nbody\n");
+		try {
+			// no per-call thinking → the frontmatter value rides the spec
+			const r1 = await dispatchTasks({
+				tasks: [{ agent: "thinker", task: "frontmatter thinking" }],
+				mode: "headless",
+				dispatcher: info(),
+				bunBin,
+				deps: deps(),
+			});
+			expect(r1.results[0].state).toBe("completed");
+			expect((await P.readSpec(join(tasksRoot, r1.results[0].id))).agent.thinking).toBe("medium");
+			// the per-call value wins over the frontmatter
+			const r2 = await dispatchTasks({
+				tasks: [{ agent: "thinker", task: "per-call thinking", thinking: "max" }],
+				mode: "headless",
+				dispatcher: info(),
+				bunBin,
+				deps: deps(),
+			});
+			expect(r2.results[0].state).toBe("completed");
+			expect((await P.readSpec(join(tasksRoot, r2.results[0].id))).agent.thinking).toBe("max");
+		} finally {
+			rmSync(thinker, { force: true });
+		}
+	}, 60_000);
+
 	it("2 + in-call queue across a foreign running task; the foreign task is adopted", async () => {
 		const foreign = await spawnForeignRunning(3500);
 		try {

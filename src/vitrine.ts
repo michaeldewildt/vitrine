@@ -202,6 +202,20 @@ export default function vitrine(pi: ExtensionAPI): void {
 					task: Type.String({ description: "Required — the mission, verbatim." }),
 					cwd: Type.Optional(Type.String({ description: "Working directory for the worker. Default: the dispatcher's cwd." })),
 					model: Type.Optional(Type.String({ description: "Model override. Default chain: agent frontmatter → dispatcher's current model." })),
+					thinking: Type.Optional(
+						Type.Union(
+							[
+								Type.Literal("off"),
+								Type.Literal("minimal"),
+								Type.Literal("low"),
+								Type.Literal("medium"),
+								Type.Literal("high"),
+								Type.Literal("xhigh"),
+								Type.Literal("max"),
+							],
+							{ description: "Thinking-level override for this task (pi --thinking levels). Default chain: agent frontmatter → pi default." },
+						),
+					),
 					from: Type.Optional(Type.String({ description: "Continue from a previous task: fork that task's worker session (its id). The source task must be terminal." })),
 					context: Type.Optional(Type.Literal("parent", { description: "Rare: seed this worker from the dispatcher's own session." })),
 					attended: Type.Optional(Type.Boolean({ description: "This workspace is the human's: auto-settle is suppressed (default false)." })),

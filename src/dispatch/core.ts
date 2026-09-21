@@ -34,6 +34,8 @@ export interface DispatchTaskInput {
 	cwd?: string;
 	/** Optional — override; default chain: agent frontmatter → dispatcher model. */
 	model?: string;
+	/** Optional — thinking-level override (pi `--thinking`); default chain: agent frontmatter → pi default. */
+	thinking?: string;
 	/** Optional — continue from a previous task's session (source guard: terminal + session.json). */
 	from?: string;
 	/** Optional (rare) — `"parent"` seeds from the dispatcher's session. `from` + `context` is rejected. */
@@ -332,8 +334,9 @@ export async function dispatchTasks(opts: DispatchOptions): Promise<DispatchRepo
 		}
 
 		// model chain: per-call > agent frontmatter > dispatcher model
+		// thinking chain: per-call > agent frontmatter > pi default (flag omitted)
 		const model = input.model ?? agent.frontmatter.model ?? info.model ?? undefined;
-		const thinking = agent.frontmatter.thinking;
+		const thinking = input.thinking ?? agent.frontmatter.thinking;
 		const tools = agent.frontmatter.noTools === true ? [] : agent.frontmatter.tools;
 		const inactivityS = input.inactivity ?? agent.frontmatter.inactivityTimeout ?? cfg.inactivity_s;
 		const wallTimeoutS = input.timeout ?? cfg.wall_timeout_s;
