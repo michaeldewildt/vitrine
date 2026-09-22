@@ -341,6 +341,44 @@ describe("worker mode (exactly one tool)", () => {
 		delete process.env.VITRINE_TASK_DIR;
 	});
 
+	it("vitrine_done with a declared output_schema that fails to compile: failing closed (the second line)", async () => {
+		const id = P.newTaskId();
+		const dir = join(tasksRoot, id);
+		// a schema typebox's Compile throws on (an invalid pattern) — the
+		// dispatch edge now rejects this at authoring; a spec that reaches
+		// vitrine_done (a hand-authored dir, or a pre-fix task) fails closed
+		// HERE, the second line: nothing is recorded
+		const outputSchema = { type: "object", properties: { x: { type: "string", pattern: "[invalid" } } };
+		const spec: P.TaskSpec = {
+			task_id: id,
+			agent: { name: "test-agent", body: "body\n" },
+			dispatcher_session_id: "disp-ext",
+			cwd: base,
+			session_id: `vitrine.${id}`,
+			session_name: `vitrine: test-agent · ${id.slice(0, 8)}`,
+			mode: "tile",
+			attended: false,
+			workspace: 9,
+			wall_timeout_s: 3600,
+			inactivity_s: 600,
+			auto_settle_s: 600,
+			auto_settle_grace_s: 60,
+			output_schema: outputSchema,
+			created_at: new Date().toISOString(),
+			boot_id: P.currentBootId(),
+		};
+		await P.createTask(dir, spec, "probe\n");
+		process.env.VITRINE_TASK_DIR = dir;
+		const { api, tools } = fakePi();
+		vitrine(api);
+		const sig = new AbortController().signal;
+		await expect(tools[0].execute!("call1", { answer: "x\n", data: { x: "y" } }, sig, undefined, fakeCtx())).rejects.toThrow(/failed to compile/);
+		// nothing half-recorded: no marker, no result
+		expect(await P.readDoneMarker(dir)).toBeNull();
+		expect(await readFile(join(dir, "result.md"), "utf8").catch(() => null)).toBeNull();
+		delete process.env.VITRINE_TASK_DIR;
+	});
+
 	it("vitrine_done failure throws (pi wraps the error into an error tool result)", async () => {
 		const id = P.newTaskId();
 		const dir = join(tasksRoot, id);

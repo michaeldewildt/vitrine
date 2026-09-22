@@ -27,6 +27,7 @@ import * as C from "../config";
 import { listAgentSummaries, resolveAgent } from "../agents";
 import { defaultHyprctl, type HyprctlResult } from "../hyprctl";
 import { issueSpawn, shortId, promptHeader, type SpawnEnv } from "./spawn";
+import { spawnInFlight } from "./loop";
 import type { PanelDeps } from "./panel";
 import { countSlots, nonTerminalTasks, reconcileAll } from "./admit";
 
@@ -196,6 +197,19 @@ export async function dispatchTasks(opts: DispatchOptions): Promise<DispatchRepo
 		if (t.output_schema !== undefined && (typeof t.output_schema !== "object" || t.output_schema === null || Array.isArray(t.output_schema))) {
 			throw new DispatchError("bad-input", "'output_schema' must be a plain object (a JSON Schema)");
 		}
+		// The fail-closed authoring-time check (the dispatch edge): a schema
+		// that does not Compile, or that carries an unknown `type` keyword
+		// (typebox silently accepts an unrecognised `type` and its Check
+		// never rejects on it — a typo'd LLM-authored schema would be
+		// silently vacuous), is rejected here with a named error the
+		// dispatcher can fix; the `vitrine_done`-time validation is the
+		// second line
+		if (t.output_schema !== undefined) {
+			const schemaErrors = P.outputSchemaErrors(t.output_schema);
+			if (schemaErrors.length > 0) {
+				throw new DispatchError("bad-input", `task for agent '${t.agent}': ${schemaErrors.join("; ")}`);
+			}
+		}
 	}
 
 	const cfg = C.readConfigSync();
@@ -331,6 +345,17 @@ export async function dispatchTasks(opts: DispatchOptions): Promise<DispatchRepo
 	if (!aborted) {
 		for (const p of planned) {
 			if (p.queuedThisCall) continue;
+			// The loop's per-task spawn guards (the no-double-spawn invariant,
+			// the same decision the wait loop makes): the session's watcher
+			// (armed at session_start) ticks in this same process between the
+			// pass's awaits and can spawn the task first — a live wrapper or a
+			// fresh spawn-issued event means the spawn is in flight: skip it
+			// (the other owner owns the spawn; the state says so on disk)
+			const st = await P.readState(p.dir).catch(() => null);
+			if (st === null || st.state !== "queued") continue;
+			const live = await P.wrapperLiveness(p.dir, st);
+			if (live.live) continue;
+			if (await spawnInFlight(p.dir)) continue;
 			await issueSpawn({ id: p.id, dir: p.dir, agentName: p.agentName, spec: p.spec }, env);
 		}
 	}

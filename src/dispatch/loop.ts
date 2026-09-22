@@ -17,7 +17,14 @@
  * in-scope queued tasks as slots free (per-task spec.mode — a mixed-mode
  * scope spawns each task the way its own dispatch planned it) → poll the
  * in-scope states → the `onPass` hook (the watcher's per-tick delivery
- * check, R3).
+ * check, R3). Every non-terminal queued task is re-admitted to the spawn
+ * decision FRESH each tick (no attach-time pinning): a task pinned by a
+ * fresh `spawn-issued` event whose wrapper never booted is re-considered
+ * every tick and (re-)spawned once the event goes stale — the per-task
+ * `spawnInFlight` guard in the spawn decision is what keeps a fresh
+ * in-flight spawn from double-spawning in the boot window (a pinned attach
+ * was a permanent slot leak: the loop's own lease refresh kept the lease
+ * fresh, so the stuck-queued reconcile never fired either).
  * Stops when every owned task is terminal AND the `pending` condition (the
  * R2 stop condition's delivery clause) is not true, or the stop signal
  * flips — NOTHING settles on abort (delivery is session-scoped, not
@@ -151,9 +158,7 @@ export async function waitForTasks(opts: WaitOptions): Promise<WaitResult> {
 		id: string;
 		dir: string;
 		spec: P.TaskSpec;
-		/** The spawn is issued (by this loop, or in flight at attach — the caller's pass spawned it and the wrapper has not flipped it off `queued` yet). */
-		spawnIssued: boolean;
-		/** True when THIS loop issued the spawn (the attach-time in-flight spawns were not issued by it). */
+		/** True when THIS loop issued the spawn (an attach-time in-flight spawn — the caller's pass or a sibling owner — was not issued by it). */
 		spawned: boolean;
 		seenState: P.TaskState;
 		seenReason?: string;
@@ -167,10 +172,12 @@ export async function waitForTasks(opts: WaitOptions): Promise<WaitResult> {
 		if (st === null) return;
 		const spec = await P.readSpec(dir).catch(() => null);
 		if (spec === null) return;
-		// a spawn in flight: the state already left `queued` (the wrapper
-		// flipped it), or the spawn-issued event is fresh (the caller's pass
-		// issued it within the wrapper's boot window) — never re-spawn it
-		owned.push({ id, dir, spec, spawnIssued: st.state !== "queued" || (await spawnInFlight(dir)), spawned: false, seenState: st.state, seenReason: st.reason });
+		// no attach-time spawn pinning: a queued task whose fresh spawn-issued
+		// event never produced a wrapper must not be excluded from the spawn
+		// decision forever (the slot leak) — the per-tick spawn decision's own
+		// fresh state read + the `spawnInFlight` guard keep a fresh in-flight
+		// spawn from double-spawning in the boot window
+		owned.push({ id, dir, spec, spawned: false, seenState: st.state, seenReason: st.reason });
 		ownedIds.add(id);
 	};
 	// a static set and a provider share the attach path — the provider is
@@ -193,8 +200,25 @@ export async function waitForTasks(opts: WaitOptions): Promise<WaitResult> {
 		// Per-tick order: reconcile → count → spawn. The loop's own
 		// unspawned tasks are the in-scope queue — excluded from the slot
 		// count (they become holders once their spawn is issued) and from
-		// reconciliation (a queue waiting on a full cap is not "stuck")
-		const unspawned = owned.filter((o) => !o.spawnIssued && !P.isTerminal(o.seenState));
+		// reconciliation (a queue waiting on a full cap is not "stuck").
+		// FRESH per tick, with the spawn guards consulted HERE (not only at
+		// issue time): a task in its boot window (a fresh spawn-issued event
+		// — the caller's pass or this loop's own previous tick — or a live
+		// wrapper) is out of the unspawned queue and thus COUNTED by the
+		// global slot count (a queued task with a fresh owner lease holds a
+		// slot — the cap is never over-admitted in the boot window); a dead
+		// spawner's STALE event un-pins the task (no attach-time pinning —
+		// the slot-leak fix), and the spawn decision below re-checks the
+		// guards immediately before it issues (the final guard)
+		const inFlight = new Set<string>();
+		for (const o of owned) {
+			if (o.seenState !== "queued") continue;
+			const st = await P.readState(o.dir).catch(() => null);
+			if (st === null || st.state !== "queued") continue;
+			const live = await P.wrapperLiveness(o.dir, st);
+			if (live.live || (await spawnInFlight(o.dir))) inFlight.add(o.dir);
+		}
+		const unspawned = owned.filter((o) => o.seenState === "queued" && !inFlight.has(o.dir));
 		const unspawnedDirs = new Set(unspawned.map((o) => o.dir));
 		await reconcileAll(now(), unspawnedDirs);
 		// Refresh this loop's lease for EVERY non-terminal in-scope task —
@@ -218,10 +242,13 @@ export async function waitForTasks(opts: WaitOptions): Promise<WaitResult> {
 				aborted = true;
 				break;
 			}
-			// a live wrapper on a queued task = a spawn in flight (by this
-			// loop's own previous tick, or by another owner) — never double-spawn;
-			// the same guard holds for the caller's pass's in-flight spawns
-			// (the spawn-issued event, the state may still be `queued`)
+			// the per-task spawn guards (the no-double-spawn invariant, shared
+			// with the dispatch pass's spawn decision): a live wrapper on a
+			// queued task = a spawn in flight (by this loop's own previous
+			// tick, or by another owner); the same guard holds for the
+			// caller's pass's in-flight spawns (the spawn-issued event, the
+			// state may still be `queued`) — a fresh event within the window
+			// is skipped, and a stale one (the dead spawner) re-issues
 			const st = await P.readState(o.dir).catch(() => null);
 			if (st === null || st.state !== "queued") continue;
 			const live = await P.wrapperLiveness(o.dir, st);
@@ -238,7 +265,6 @@ export async function waitForTasks(opts: WaitOptions): Promise<WaitResult> {
 				o.seenState = after.state;
 				o.seenReason = after.reason;
 			}
-			o.spawnIssued = true;
 			o.spawned = true;
 			if (!P.isTerminal(o.seenState)) slots++;
 		}

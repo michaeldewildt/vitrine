@@ -47,6 +47,7 @@ import {
 	type WaitResult,
 	type WorkerWindow,
 } from "./dispatch";
+import { startSessionWatcher } from "./watcher";
 
 let tb: TestBase;
 let base: string;
@@ -215,6 +216,49 @@ describe("surface validation", () => {
 		await rejectsDispatch("bad-input", () => dispatchTasks({ tasks: [{ agent: "test-agent", task: "t", max_cost_usd: -1 }], mode: "tile", dispatcher: info(), bunBin, deps: d }));
 	});
 
+	it("rejects an output_schema that does not compile or carries an unknown type keyword (fail-closed at authoring, bad-input)", async () => {
+		const h = { hyprctl: async (): Promise<HyprctlResult> => ({ code: 0, stdout: "", stderr: "" }) };
+		const d = deps({ hyprctl: h.hyprctl });
+		// unknown `type` keyword at the root: typebox 1.3.x compiles this
+		// silently and its Check never rejects on the type (a typo'd
+		// LLM-authored schema would be silently vacuous — unvalidated data
+		// reported as validated) — the dispatch edge is the named-error gate
+		const msg = await rejectsDispatch("bad-input", () =>
+			dispatchTasks({
+				tasks: [{ agent: "test-agent", task: "t", output_schema: { type: "strng", properties: { x: { type: "string" } }, required: ["x"] } }],
+				mode: "headless",
+				dispatcher: info(),
+				bunBin,
+				deps: d,
+			}),
+		);
+		expect(msg).toContain("unknown type keyword 'strng'");
+		expect(msg).toContain("known types: object, array, string, number, integer, boolean, null");
+		// the walk covers the nested surface (properties + anyOf)
+		const msg2 = await rejectsDispatch("bad-input", () =>
+			dispatchTasks({
+				tasks: [{ agent: "test-agent", task: "t", output_schema: { type: "object", properties: { x: { type: "strng" } }, anyOf: [{ type: "strng2" }] } }],
+				mode: "headless",
+				dispatcher: info(),
+				bunBin,
+				deps: d,
+			}),
+		);
+		expect(msg2).toContain("at properties.x");
+		expect(msg2).toContain("at anyOf[0]");
+		// a schema that does not Compile (typebox throws: an invalid pattern)
+		const msg3 = await rejectsDispatch("bad-input", () =>
+			dispatchTasks({
+				tasks: [{ agent: "test-agent", task: "t", output_schema: { type: "object", properties: { x: { type: "string", pattern: "[invalid" } } } }],
+				mode: "headless",
+				dispatcher: info(),
+				bunBin,
+				deps: d,
+			}),
+		);
+		expect(msg3).toContain("failed to compile");
+	});
+
 	it("an unknown agent is a bad-agent that lists the available names", async () => {
 		const msg = await rejectsDispatch("bad-agent", () =>
 			dispatchTasks({ tasks: [{ agent: "nope", task: "t" }], mode: "tile", dispatcher: info(), bunBin, deps: deps({ hyprctl: async () => ({ code: 0, stdout: "", stderr: "" }) }) }),
@@ -371,6 +415,120 @@ describe("spawn failure settles immediately (failed-to-spawn)", () => {
 			}
 		}
 	});
+});
+
+// ---------------------------------------------------------------------------
+// the spawn pass's double-spawn guard (the pass consults the loop's guards)
+
+describe("the spawn pass's double-spawn guard (the pass consults the loop's guards)", () => {
+	it("a concurrent watcher that spawns the task first is not double-spawned by the pass (the no-double-spawn invariant)", async () => {
+		// The session's watcher (armed at session_start) ticks in the SAME
+		// process between the pass's awaits and can spawn a pass task before
+		// the pass's own issue reaches it: in tile mode each pass issue is
+		// slow (the join juggle + the delayed exec_cmd), so the watcher's
+		// ticks land inside the pass's issue windows. The pass must consult
+		// the loop's spawn guards (wrapper liveness + spawnInFlight) and
+		// skip a task whose spawn is already in flight — otherwise the task
+		// gets a second `spawn-issued` (bounded today by the wrapper's
+		// queued→running CAS — the loser exits handoff-lost — but the stated
+		// invariant is no double-spawn).
+		const localBinDir = join(process.env.HOME!, ".local", "bin");
+		mkdirSync(localBinDir, { recursive: true });
+		const localBin = join(localBinDir, "vitrine-run");
+		writeFileSync(localBin, "#!/bin/sh\nexit 0\n");
+		chmodSync(localBin, 0o755);
+		// a fresh tasks root: the watcher's live scope is the session's tasks
+		// (the shared root's leftovers would sit in it — and its own
+		// unspawned queue excludes itself from the slot count, so a foreign
+		// slot holder would starve the race)
+		const raceRoot = join(base, "race-tasks");
+		await mkdir(raceRoot, { recursive: true });
+		const prevRoot = process.env.VITRINE_TASKS_ROOT;
+		process.env.VITRINE_TASKS_ROOT = raceRoot;
+		// a pre-existing crashed task of this session: the watcher's loop
+		// stops on its first tick over an EMPTY scope (vacuously all
+		// terminal) — production arms the watcher where the session's
+		// tasks exist (session_start, or the dispatch's own re-arm). A
+		// terminal task holds no slot (the slot count is liveness-
+		// qualified), so it keeps the loop alive (the failing send keeps it
+		// pending) without starving the cap.
+		const gid = P.newTaskId();
+		const gdir = join(raceRoot, gid);
+		await P.createTask(
+			gdir,
+			{
+				task_id: gid,
+				agent: { name: "test-agent", body: "ghost body\n" },
+				dispatcher_session_id: info().sessionId,
+				cwd: base,
+				session_id: `vitrine.${gid}`,
+				session_name: `test-agent · ${gid.slice(0, 8)}`,
+				mode: "tile",
+				attended: false,
+				workspace: 9,
+				wall_timeout_s: 3600,
+				inactivity_s: 600,
+				auto_settle_s: 600,
+				auto_settle_grace_s: 60,
+				async: true,
+				created_at: new Date().toISOString(),
+				boot_id: P.currentBootId(),
+			},
+			"ghost prompt\n",
+		);
+		await writeFile(join(gdir, "result.md"), "ghost harvest\n");
+		await P.transitionState(gdir, "queued", "running", { started_at: new Date().toISOString() });
+		await P.transitionState(gdir, "running", "crashed", { finished_at: new Date().toISOString() });
+		// the watcher: fast ticks, fast (stub) tile issue — it spawns the
+		// pass's queued tasks during the pass's slow issue windows; the
+		// failing send keeps the ghost pending (the loop's alive clause)
+		const w = startSessionWatcher({
+			sessionId: info().sessionId,
+			send: () => Promise.reject(new Error("test send failure")),
+			replay: false,
+			tickMs: 50,
+			mode: "tile",
+			bunBin,
+			spawnDeps: { hyprctl: async () => ({ code: 0, stdout: "", stderr: "" }), mapWaitMs: 1, mapWaitTickMs: 1 },
+		});
+		try {
+			await new Promise((r) => setTimeout(r, 150)); // the watcher's first ticks land
+			const r = await dispatchTasks({
+				tasks: [1, 2].map((n) => ({ agent: "test-agent", task: `race ${n}` })),
+				mode: "tile",
+				dispatcher: info(),
+				bunBin,
+				deps: deps({
+					hyprctl: async (args) => {
+						// the pass's issue window is real: the exec_cmd dispatch
+						// (the spawn call) is delayed, the juggle's other
+						// hyprctl calls are fast
+						if (args.join(" ").includes("hl.dsp.exec_cmd")) await new Promise((res) => setTimeout(res, 1200));
+						return { code: 0, stdout: "", stderr: "" };
+					},
+					mapWaitMs: 400,
+					mapWaitTickMs: 50,
+				}),
+			});
+			// the pass and the watcher contested the same queued tasks (the
+			// pass's slow issue window is the race — each pass issue is 1.6 s,
+			// so the watcher's ticks land inside the windows); two tasks =
+			// the whole cap, so a contended task that the watcher issues first
+			// holds a slot (fresh owner lease) and the pass's guard must skip
+			// it — under the old unconditional issue the contended task would
+			// carry a second `spawn-issued` (the loser's wrapper would exit
+			// handoff-lost, but the stated invariant is no double-spawn)
+			for (const res of r.results) {
+				const dir = join(raceRoot, res.id);
+				const issued = (await P.readEvents(dir)).filter((e) => e.event === "spawn-issued");
+				expect(issued, `task ${res.id}`).toHaveLength(1);
+			}
+		} finally {
+			w.close();
+			process.env.VITRINE_TASKS_ROOT = prevRoot;
+			rmSync(localBin, { force: true });
+		}
+	}, 40_000);
 });
 
 // ---------------------------------------------------------------------------

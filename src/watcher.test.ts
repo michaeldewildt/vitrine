@@ -30,7 +30,7 @@ import { join } from "node:path";
 import * as C from "./config";
 import * as P from "./protocol";
 import { formatElapsed, issueSpawn, shortId, type SpawnEnv } from "./dispatch/spawn";
-import { spawnInFlight } from "./dispatch/loop";
+import { spawnInFlight, waitForTasks } from "./dispatch/loop";
 import {
 	MAX_SEND_ATTEMPTS,
 	BACKOFF_CAP_MS,
@@ -975,6 +975,77 @@ describe("the session-scoped watcher — the queue duties (R2)", () => {
 			await killGhost(g2.id, g2.pid, g2.proc);
 		}
 	}, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// the loop's per-tick spawn re-evaluation (the slot-leak regression)
+
+describe("the loop's per-tick spawn re-evaluation (the slot-leak regression)", () => {
+	it("a queued task pinned by a fresh spawn-issued event whose wrapper never booted is (re-)spawned once the event goes stale", async () => {
+		const root = freshRoot();
+		try {
+			const sid = "w-leak";
+			const id = P.newTaskId();
+			const dir = await makeTask(id, { dispatcher_session_id: sid });
+			// the pass issued the spawn (the event is on disk, FRESH) but the
+			// wrapper never booted (spawn returned success, no window came
+			// up): a pinned attach excluded this task from the unspawned
+			// queue forever — the loop's own lease refresh kept the lease
+			// fresh, so the stuck-queued reconcile never fired either — a
+			// permanent slot leak. The loop re-evaluates the guard every tick
+			// and (re-)issues once the event goes stale (the real 15 s
+			// window, wall clock).
+			await P.appendEvent(dir, { event: "spawn-issued", source: "dispatch" });
+			const w = await Promise.race([
+				waitForTasks({
+					ids: [id],
+					mode: "headless",
+					bunBin: () => process.execPath,
+					lease: { owner: sid, nonce: "w-leak" },
+					deps: { tickMs: 500 },
+				}),
+				new Promise<never>((_r, rej) => setTimeout(() => rej(new Error("the loop never (re-)spawned the stale-event task (the slot leak)")), 30_000)),
+			]);
+			expect(w.aborted).toBe(false);
+			expect(w.states[0].state).toBe("completed");
+			expect(w.states[0].spawned).toBe(true); // the loop (re-)issued the spawn
+			const events = (await P.readEvents(dir)).filter((e) => e.event === "spawn-issued");
+			expect(events).toHaveLength(2); // the dead spawner's + the loop's re-spawn
+		} finally {
+			root.restore();
+		}
+	}, 45_000);
+
+	it("a fresh spawn-issued event within the window is NOT double-spawned by the live loop (the per-tick guard)", async () => {
+		const root = freshRoot();
+		const ac = new AbortController();
+		try {
+			const sid = "w-nodup";
+			const id = P.newTaskId();
+			const dir = await makeTask(id, { dispatcher_session_id: sid });
+			await P.appendEvent(dir, { event: "spawn-issued", source: "dispatch" });
+			const p = waitForTasks({
+				ids: [id],
+				mode: "headless",
+				bunBin: () => process.execPath,
+				lease: { owner: sid, nonce: "w-nodup" },
+				deps: { tickMs: 150, signal: ac.signal },
+			});
+			// a few ticks inside the in-flight window: the slot is free and
+			// the task is queued — per-tick re-admission alone (without the
+			// spawnInFlight guard) would (re-)issue a second spawn here
+			await new Promise((r) => setTimeout(r, 700));
+			ac.abort();
+			const w = await p;
+			expect(w.aborted).toBe(true);
+			expect((await P.readState(dir)).state).toBe("queued");
+			// no second issue: the fresh event within the window is skipped
+			expect((await P.readEvents(dir)).filter((e) => e.event === "spawn-issued")).toHaveLength(1);
+		} finally {
+			ac.abort();
+			root.restore();
+		}
+	}, 15_000);
 });
 
 // ---------------------------------------------------------------------------
