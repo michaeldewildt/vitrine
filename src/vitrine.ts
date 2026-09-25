@@ -69,9 +69,7 @@ const DISPATCH_MECHANICS =
 	"Dispatch one or more tasks to specialist agents (pi agent files), each in its own visible workspace " +
 	"(a Hyprland/foot tile when the compositor is reachable, otherwise a headless background worker). " +
 	"Returns immediately after the spawn/admission pass — per task: short id, agent, and state (running or " +
-	"queued). Each task's harvest is reported on settlement as a delivery; it never lands in the tool " +
-	"result — do not act on a worker's result in the same turn you dispatched it. " +
-	"pi's docs call starting a new agent 'spawn' — this is that spawn: it starts one worker per task and dispatches the task to it.";
+	"queued). pi's docs call starting a new agent 'spawn' — this is that spawn: it starts one worker per task and dispatches the task to it.";
 
 /**
  * The `vitrine_collect` mechanics (R9): the pull-floor doctrine — dispatch
@@ -82,10 +80,10 @@ const DISPATCH_MECHANICS =
  * section bounds).
  */
 const COLLECT_MECHANICS =
-	"Pull vitrine results on demand — the pull floor that complements vitrine_dispatch: dispatch returns immediately (ids + state, no harvest) " +
-	"and each task's harvest arrives as a delivery on settlement; this tool is how you get a result when you want it now. " +
-	"It answers immediately from disk and NEVER blocks on a running worker — so never busy-poll collect inside a turn to wait a worker out: " +
-	"the delivery is the result path, and a turn that dispatched must not act on the result in the same turn.\n" +
+	"Pull vitrine results on demand — the pull floor that complements vitrine_dispatch, which returns immediately (ids + state, no harvest) " +
+	"and delivers each task's harvest on settlement; this tool is how you get a result when you want it now. " +
+	"It answers immediately from disk and NEVER blocks on a running worker — so never busy-poll collect inside a turn to wait a worker out; " +
+	"the delivery is the result path.\n" +
 	"Per task: terminal → the full harvest in the fixed wrapper (capped — the 0600 overflow file's path is named in the body, and reading it " +
 	"is the sanctioned response to a truncated body) + delivery status; running/queued → a status line (state, elapsed, workspace) with no body; " +
 	"a terminal task a human resumed in its tile → the session's latest output as an advisory note (never a state change, never a re-delivery).\n" +
@@ -119,7 +117,7 @@ export function composeDispatchDescription(): string {
 	}
 	parts.push(
 		"Dispatch when a side task would flood this context, for parallel mechanical units, or for an independent check; not for a single sequential unit or judgment work that needs the conversation.\n" +
-			"Dispatch returns immediately — each task's result arrives as a delivery on settlement; never act on a worker's result in the same turn you dispatched it, and never busy-wait for it. " +
+			"Each task's harvest arrives as a delivery on settlement — it never lands in the tool result. Never act on a worker's result in the same turn you dispatched it, and never busy-wait for it; " +
 			"vitrine_collect is the on-demand pull for a result you want now (an explicit status check, a re-harvest after a human resumed a worker, or a delivery-path diagnosis) — pull when you want it, never busy-poll collect inside a turn.\n" +
 			"Project-local `.pi/agents/` agents shadow these when the project is trusted; an unknown-agent error lists the live roster.",
 	);

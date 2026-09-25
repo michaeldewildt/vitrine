@@ -851,7 +851,7 @@ describe("dispatch description (the roster is composed at load)", () => {
 			"Dispatch when a side task would flood this context, for parallel mechanical units, or for an independent check; not for a single sequential unit or judgment work that needs the conversation.",
 		);
 		expect(d).toContain(
-			"Dispatch returns immediately — each task's result arrives as a delivery on settlement; never act on a worker's result in the same turn you dispatched it, and never busy-wait for it. vitrine_collect is the on-demand pull for a result you want now", 
+			"Each task's harvest arrives as a delivery on settlement — it never lands in the tool result. Never act on a worker's result in the same turn you dispatched it, and never busy-wait for it; vitrine_collect is the on-demand pull for a result you want now",
 		);
 		expect(d).toContain(
 			"Project-local `.pi/agents/` agents shadow these when the project is trusted; an unknown-agent error lists the live roster.",
