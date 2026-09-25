@@ -19,7 +19,7 @@
 import { appendEvent, assertTaskDir } from "./fs";
 import { readSpec } from "./spec";
 import { isTerminal, readState, transitionState, type TaskState } from "./state";
-import { readLease } from "./files";
+import { readLease, LEASE_TTL_MS } from "./files";
 import { killRequested, readDoneMarker, requestKill } from "./files";
 import { pidInfo, wrapperLiveness } from "./env";
 
@@ -103,15 +103,19 @@ export interface StuckQueuedResult {
 /**
  * A task that was never given a wrapper (the dispatcher aborted
  * or died before spawning, or the tile never came up): `queued` with no
- * LIVE wrapper for longer than `minAgeMs` ⇒ `crashed` with reason
+ * LIVE wrapper whose owner lease is stale ⇒ `crashed` with reason
  * `never-spawned` — a queued task that holds a slot must never do so forever.
- * A `kill_requested` queued task settles `kill-requested` instead (the
- * human's explicit kill wins over the timeout label). A live wrapper pid
- * means a spawn is in flight — never touched. The marker wins even on
- * queued (ordering rule 1), lease or not. The owner lease gates the settle:
- * the creating dispatch call refreshes `lease.json` on every tick of its
- * wait loop, so a live owner's tasks are waiting on the cap, not stuck; a
- * dead owner's lease goes stale and the task settles.
+ * The predicate keys on LEASE FRESHNESS, not creation age: the live owner
+ * (the dispatch call, or the session-scoped watcher that owns the queue from
+ * it) refreshes `lease.json` on every tick, so a queue behind a slow worker
+ * — minutes long — is a live queue, not a dead dispatcher's residue. A dead
+ * owner's lease goes stale and the task settles. The creation-age window
+ * (`minAgeMs`) remains a grace: a task that has just come into being is never
+ * settled, lease or not (an unparseable creation timestamp degrades to no
+ * grace — a corrupt spec is not a live task). A `kill_requested` queued task
+ * settles `kill-requested` instead (the human's explicit kill wins over the
+ * timeout label). A live wrapper pid means a spawn is in flight — never
+ * touched. The marker wins even on queued (ordering rule 1), lease or not.
  */
 export async function reconcileStuckQueued(
 	dir: string,
@@ -119,7 +123,7 @@ export async function reconcileStuckQueued(
 ): Promise<StuckQueuedResult> {
 	const d = await assertTaskDir(dir);
 	const minAgeMs = opts.minAgeMs ?? 15_000;
-	const leaseTtlMs = opts.leaseTtlMs ?? 30_000;
+	const leaseTtlMs = opts.leaseTtlMs ?? LEASE_TTL_MS;
 	const now = opts.now ?? Date.now();
 	const st = await readState(d);
 	if (st.state !== "queued") return { dir: d, settled: "none", state: st.state, reason: `state is ${st.state}, not queued` };
@@ -127,21 +131,17 @@ export async function reconcileStuckQueued(
 	if (live.live) {
 		return { dir: d, settled: "none", state: st.state, reason: `${live.reason} — spawn in flight` };
 	}
-	const spec = await readSpec(d);
-	const age = now - Date.parse(spec.created_at);
-	if (!Number.isFinite(age) || age < minAgeMs) {
-		return { dir: d, settled: "none", state: st.state, reason: `younger than the ${minAgeMs}ms stuck window` };
-	}
 	// Ordering rule 1 first — the marker wins even on queued, lease or not:
-	// a completed result must not be held back by a fresh owner lease.
+	// a completed result must not be held back by a fresh owner lease (a
+	// wrapper that died mid-spawn can still have the worker's done-marker
+	// land). With a marker present the settle below is the completed remap.
 	const marker = await readDoneMarker(d).catch(() => null);
 	if (marker === null) {
-		// The owner lease (the cross-call gate): a queued task whose creating
-		// dispatch call is still ticking is waiting on the cap, not stuck —
-		// the owner refreshes lease.json every tick of its wait loop, and a
-		// dead owner (crash, reboot, abort) stops refreshing. A lease-read
-		// failure is treated as absent (settle), mirroring killRequested:
-		// the CAS below is the final guard either way.
+		// The lease gate (the freshness key): a queued task whose owner is
+		// still ticking is waiting on the cap, not stuck — the owner refreshes
+		// lease.json every tick, and a dead owner (crash, reboot, abort) stops
+		// refreshing. A lease-read failure is treated as absent (settle),
+		// mirroring killRequested: the CAS below is the final guard either way.
 		const lease = await readLease(d).catch(() => null);
 		if (lease !== null) {
 			const leaseAge = now - Date.parse(lease.updated_at);
@@ -149,11 +149,20 @@ export async function reconcileStuckQueued(
 				return { dir: d, settled: "none", state: st.state, reason: `owner lease fresh (${Math.round(leaseAge)}ms < ${leaseTtlMs}ms TTL) — waiting on the cap, not stuck` };
 			}
 		}
+		// The creation-age grace (the secondary key): a task that has just come
+		// into being is never settled (its owner may be between the create and
+		// the first lease refresh); an unparseable creation timestamp degrades
+		// to no grace — with a stale or absent lease such a task settles, not
+		// lingers.
+		const spec = await readSpec(d);
+		const age = now - Date.parse(spec.created_at);
+		if (Number.isFinite(age) && age < minAgeMs) {
+			return { dir: d, settled: "none", state: st.state, reason: `younger than the ${minAgeMs}ms stuck window` };
+		}
 	}
-	// The marker wins even on queued (rule 1): a wrapper that died mid-spawn can
-	// still have the worker's done-marker land. A single settle call covers
-	// both cases — with a marker present (at decision or CAS time) the
-	// transitionState remap maps the requested `crashed` to `completed`.
+	// A single settle call covers both cases — with a marker present (at
+	// decision or CAS time) the transitionState remap maps the requested
+	// `crashed` to `completed`.
 	const killed = await killRequested(d).catch(() => false);
 	const reason = killed ? "kill-requested" : "never-spawned";
 	const t = await transitionState(d, "queued", "crashed", {}, reason);

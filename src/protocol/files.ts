@@ -71,6 +71,17 @@ export async function writeResult(dir: string, text: string): Promise<void> {
 	await atomicWriteFile(join(d, "result.md"), text);
 }
 
+/**
+ * Write `result.json` — the typed data payload (`vitrine_done`'s `data`
+ * parameter, validated at the call against the task's `output_schema`).
+ * Sibling of `writeResult`: the prose answer (`result.md`) and the typed
+ * contract (`result.json`) stay orthogonal.
+ */
+export async function writeResultJson(dir: string, data: unknown): Promise<void> {
+	const d = await assertTaskDir(dir);
+	await atomicWriteFile(join(d, "result.json"), `${JSON.stringify(data, null, 2)}\n`);
+}
+
 export interface DoneMarker {
 	ts: string;
 	/** `headless-exit` — the wrapper's own marker for a clean `--print` exit: headless completion is the process exit, made durable so ordering rule 1/2 see a marker for a genuinely-finished task. */
@@ -113,6 +124,15 @@ export async function readDoneMarker(dir: string): Promise<DoneMarker | null> {
 
 // ---------------------------------------------------------------------------
 // lease.json (owner claim — the stuck-queued gate)
+
+/**
+ * The lease-freshness window: a lease younger than this is a live owner
+ * (someone is still ticking the queue). The stuck-queued settle and the
+ * slot count both key on this — a queue is live while its owner refreshes,
+ * whatever its creation age (a queue behind a slow worker is minutes long,
+ * not 15 s).
+ */
+export const LEASE_TTL_MS = 30_000;
 
 /**
  * The owner's claim on a queued task: written by the dispatch call that

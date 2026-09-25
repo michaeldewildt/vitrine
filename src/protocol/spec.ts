@@ -8,6 +8,8 @@
  */
 import { mkdir, realpath, rm, stat } from "node:fs/promises";
 import { basename, isAbsolute, join } from "node:path";
+import type { TSchema } from "typebox";
+import { Compile } from "typebox/compile";
 import { ProtocolError } from "./errors";
 import { appendEvent, assertTaskDir, atomicWriteFile, readTaskFile, tasksRoot, UUID_RE } from "./fs";
 
@@ -46,9 +48,19 @@ export interface TaskSpec {
 	/** Auto-close for completed tiles, seconds (default 600). 0 = never; optional — the wrapper falls back to 600 when absent. */
 	completed_close_s?: number;
 	max_cost_usd?: number;
+	/** The typed-harvest contract — a JSON Schema (plain object) the worker's `vitrine_done` `data` payload must satisfy. Rides spec.json; the worker validates the payload at the call and records it to `result.json` (the prose answer in `result.md` and the typed data stay orthogonal). */
+	output_schema?: Record<string, unknown>;
 	from_task_id?: string;
 	/** Raw session file to fork — `context` tasks fork the dispatcher's own live session file, which lives in no task dir. Mutually exclusive with `from_task_id`. */
 	from_session_file?: string;
+	/**
+	 * The delivery-eligibility marker (the upgrade boundary): written `true`
+	 * on every task created from the async-dispatch change onward. Absent on
+	 * historical (blocking-era) task dirs — their absence is the clean upgrade
+	 * boundary: historical tasks are excluded from delivery, replay, and the
+	 * gc-skip by the absence of this field.
+	 */
+	async?: boolean;
 	created_at: string;
 	boot_id: string;
 }
@@ -69,6 +81,7 @@ const nonEmpty = (v: unknown): boolean => typeof v === "string" && v !== "";
 const absPath: Pred = (v) => typeof v === "string" && isAbsolute(v);
 const uuid: Pred = (v) => typeof v === "string" && UUID_RE.test(v);
 const posNum: Pred = (v) => typeof v === "number" && v > 0;
+const plainObject: Pred = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
 const posInt: Pred = (v) => typeof v === "number" && Number.isInteger(v) && v > 0;
 const nonNegInt: Pred = (v) => typeof v === "number" && Number.isInteger(v) && v >= 0;
 const isoTs: Pred = (v) => typeof v === "string" && !Number.isNaN(Date.parse(v));
@@ -88,8 +101,10 @@ const SPEC_FIELDS: FieldDef[] = [
 	{ key: "auto_settle_grace_s", msg: "auto_settle_grace_s must be a positive number", pred: posNum },
 	{ key: "completed_close_s", msg: "completed_close_s must be a non-negative integer (0 = never auto-close)", pred: nonNegInt, optional: true },
 	{ key: "max_cost_usd", msg: "max_cost_usd must be a positive number", pred: posNum, optional: true },
+	{ key: "output_schema", msg: "output_schema must be a plain object (a JSON Schema)", pred: plainObject, optional: true },
 	{ key: "from_task_id", msg: "from_task_id must be a lowercase uuidv4", pred: uuid, optional: true },
 	{ key: "from_session_file", msg: "from_session_file must be a non-empty string", pred: nonEmpty, optional: true },
+	{ key: "async", msg: "async must be a boolean (the delivery-eligibility marker)", pred: (v) => typeof v === "boolean", optional: true },
 	{ key: "created_at", msg: "created_at must be an ISO timestamp", pred: isoTs },
 	{ key: "boot_id", msg: "boot_id is required", pred: nonEmpty },
 ];
@@ -105,6 +120,83 @@ const AGENT_FIELDS: FieldDef[] = [
 const fail = (msg: string): never => {
 	throw new ProtocolError("bad-spec", msg);
 };
+
+// ---------------------------------------------------------------------------
+// output_schema — the fail-closed authoring-time check (the dispatch edge)
+
+/**
+ * The JSON type vocabulary the installed typebox's `Compile` honours —
+ * the seven JSON types (typebox 1.3.32 exports no type-name constant;
+ * verified: every one of these is discriminated by the compiler's
+ * `Check`, and every other name is silently ignored — `Compile` does
+ * not throw on an unrecognised `type`, and its `Check` never rejects on
+ * it. A typo'd LLM-authored `output_schema` would otherwise be silently
+ * vacuous: the harvest would report unvalidated data as validated.)
+ */
+export const KNOWN_JSON_TYPES: readonly string[] = ["object", "array", "string", "number", "integer", "boolean", "null"];
+
+/**
+ * The schema's `type` / `anyOf` / `oneOf` / `properties` surface, walked
+ * for unknown `type` keywords (a `type` may be a single name or an array
+ * of names — JSON Schema). Returns the offending `type` values with their
+ * location (empty = clean). Non-object nodes are skipped (the compile
+ * check is what catches the shape).
+ */
+export interface UnknownTypeKeyword {
+	/** The location: `(root)`, `properties.<name>`, `anyOf[<i>]`, ... (a JSON-pointer-ish path). */
+	path: string;
+	/** The offending `type` value, as it appears in the schema. */
+	type: string;
+}
+
+export function unknownTypeKeywords(schema: unknown): UnknownTypeKeyword[] {
+	const bad: UnknownTypeKeyword[] = [];
+	const walk = (node: unknown, path: string): void => {
+		if (typeof node !== "object" || node === null) return;
+		const o = node as Record<string, unknown>;
+		if (o.type !== undefined) {
+			const types = Array.isArray(o.type) ? o.type : [o.type];
+			for (const t of types) {
+				if (!KNOWN_JSON_TYPES.includes(String(t))) bad.push({ path: path === "" ? "(root)" : path, type: String(t) });
+			}
+		}
+		if (o.properties !== undefined && typeof o.properties === "object" && o.properties !== null && !Array.isArray(o.properties)) {
+			for (const [k, v] of Object.entries(o.properties as Record<string, unknown>)) {
+				walk(v, path === "" ? `properties.${k}` : `${path}.properties.${k}`);
+			}
+		}
+		for (const key of ["anyOf", "oneOf"] as const) {
+			const arr = o[key];
+			if (Array.isArray(arr)) arr.forEach((v, i) => walk(v, path === "" ? `${key}[${i}]` : `${path}.${key}[${i}]`));
+		}
+	};
+	walk(schema, "");
+	return bad;
+}
+
+/**
+ * The fail-closed authoring-time check for a task's `output_schema` — the
+ * dispatch edge rejects on a non-empty result (the `vitrine_done`-time
+ * validation stays the second line):
+ * 1. the schema must `Compile` (typebox) — a schema that does not compile
+ *    is unverifiable at the call;
+ * 2. every `type` keyword on the schema's `type`/`anyOf`/`oneOf`/
+ *    `properties` surface must be a known JSON type (see
+ *    `unknownTypeKeywords` — the compiler's silent-ignore is the fail-open
+ *    this walk closes).
+ */
+export function outputSchemaErrors(schema: Record<string, unknown>): string[] {
+	const errors: string[] = [];
+	try {
+		Compile(schema as TSchema);
+	} catch (e: unknown) {
+		errors.push(`output_schema failed to compile: ${e instanceof Error ? e.message : String(e)}`);
+	}
+	for (const { path, type } of unknownTypeKeywords(schema)) {
+		errors.push(`output_schema has an unknown type keyword '${type}' at ${path} (known types: ${KNOWN_JSON_TYPES.join(", ")})`);
+	}
+	return errors;
+}
 
 function checkField(o: Record<string, unknown>, f: FieldDef, prefix: string): void {
 	const v = o[f.key];

@@ -1,9 +1,13 @@
 /**
  * dispatch.test.ts — the dispatch tool suite:
- * admission (2 + in-call queue across a foreign running task; the
- * self-deadlock batch), reconciliation (stuck-queued settle + the
- * `kill_requested` interaction; deferred harvest), exact argv-array spawn
- * construction, result format + caps + 0600 overflow, abort-hook marking.
+ * the R1 contract (the tool returns after the spawn/admission pass — before
+ * the first settlement, no harvest in the result), admission (2 + queue
+ * across a foreign running task; the work-conserving batch, driven to
+ * terminal by the factored wait loop), reconciliation (the lease-keyed
+ * stuck-queue settle + the `kill_requested` interaction; the dead-lease
+ * residue path), exact argv-array spawn construction, result format (the
+ * R1 shape) + caps + 0600 overflow (the harvest machinery), abort-hook
+ * marking (a pre-aborted signal skips the spawn pass).
  *
  * Hermetic: HOME/VITRINE_TASKS_ROOT/VITRINE_SESSIONS_DIR point at a tmp dir;
  * the compositor is injected (no hyprland); headless E2E runs the REAL
@@ -28,20 +32,22 @@ import {
 	harvestTask,
 	listAllWindows,
 	listWorkerWindows,
-	pendingDispatchedIds,
 	probeCompositor,
 	readActiveWindow,
 	readPpid,
-	renderReport,
+	renderDispatch,
 	spawnTileWithJoin,
 	tileSpawnArgv,
 	toggleGroup,
+	waitForTasks,
 	type DispatchDeps,
 	type DispatchedTaskResult,
 	type DispatcherInfo,
 	type HyprctlResult,
+	type WaitResult,
 	type WorkerWindow,
 } from "./dispatch";
+import { startSessionWatcher } from "./watcher";
 
 let tb: TestBase;
 let base: string;
@@ -111,6 +117,21 @@ function deps(over: Partial<DispatchDeps> = {}): DispatchDeps {
 		sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
 		...over,
 	};
+}
+
+/**
+ * Drive the factored wait loop in-process over a dispatch call's ids — the
+ * watcher/bench pattern (R1/R10): the tool returns after the spawn pass,
+ * and the wait (admit as slots free + spawn + poll) is the loop's job.
+ */
+function waitAll(ids: string[], over: Partial<DispatchDeps> = {}): Promise<WaitResult> {
+	return waitForTasks({
+		ids,
+		mode: "headless",
+		bunBin,
+		lease: { owner: "disp-test", nonce: "test-wait" },
+		deps: { tickMs: 150, sleep: (ms) => new Promise((r) => setTimeout(r, ms)), ...over },
+	});
 }
 
 /** A spec good enough for createTask (mode "tile" — ghost tasks never spawn). */
@@ -193,6 +214,49 @@ describe("surface validation", () => {
 		const d = deps({ hyprctl: h.hyprctl });
 		await rejectsDispatch("bad-input", () => dispatchTasks({ tasks: [{ agent: "test-agent", task: "t", max_cost_usd: 0 }], mode: "tile", dispatcher: info(), bunBin, deps: d }));
 		await rejectsDispatch("bad-input", () => dispatchTasks({ tasks: [{ agent: "test-agent", task: "t", max_cost_usd: -1 }], mode: "tile", dispatcher: info(), bunBin, deps: d }));
+	});
+
+	it("rejects an output_schema that does not compile or carries an unknown type keyword (fail-closed at authoring, bad-input)", async () => {
+		const h = { hyprctl: async (): Promise<HyprctlResult> => ({ code: 0, stdout: "", stderr: "" }) };
+		const d = deps({ hyprctl: h.hyprctl });
+		// unknown `type` keyword at the root: typebox 1.3.x compiles this
+		// silently and its Check never rejects on the type (a typo'd
+		// LLM-authored schema would be silently vacuous — unvalidated data
+		// reported as validated) — the dispatch edge is the named-error gate
+		const msg = await rejectsDispatch("bad-input", () =>
+			dispatchTasks({
+				tasks: [{ agent: "test-agent", task: "t", output_schema: { type: "strng", properties: { x: { type: "string" } }, required: ["x"] } }],
+				mode: "headless",
+				dispatcher: info(),
+				bunBin,
+				deps: d,
+			}),
+		);
+		expect(msg).toContain("unknown type keyword 'strng'");
+		expect(msg).toContain("known types: object, array, string, number, integer, boolean, null");
+		// the walk covers the nested surface (properties + anyOf)
+		const msg2 = await rejectsDispatch("bad-input", () =>
+			dispatchTasks({
+				tasks: [{ agent: "test-agent", task: "t", output_schema: { type: "object", properties: { x: { type: "strng" } }, anyOf: [{ type: "strng2" }] } }],
+				mode: "headless",
+				dispatcher: info(),
+				bunBin,
+				deps: d,
+			}),
+		);
+		expect(msg2).toContain("at properties.x");
+		expect(msg2).toContain("at anyOf[0]");
+		// a schema that does not Compile (typebox throws: an invalid pattern)
+		const msg3 = await rejectsDispatch("bad-input", () =>
+			dispatchTasks({
+				tasks: [{ agent: "test-agent", task: "t", output_schema: { type: "object", properties: { x: { type: "string", pattern: "[invalid" } } } }],
+				mode: "headless",
+				dispatcher: info(),
+				bunBin,
+				deps: d,
+			}),
+		);
+		expect(msg3).toContain("failed to compile");
 	});
 
 	it("an unknown agent is a bad-agent that lists the available names", async () => {
@@ -310,10 +374,8 @@ describe("spawn failure settles immediately (failed-to-spawn)", () => {
 		const localBin = join(localBinDir, "vitrine-run");
 		writeFileSync(localBin, "#!/bin/sh\nexit 0\n");
 		chmodSync(localBin, 0o755);
-		// abort after a beat: the spawn has happened by then; the call leaves
-		// without waiting out the 15 s stuck-queued window
-		const controller = new AbortController();
-		const timer = setTimeout(() => controller.abort(), 300);
+		// no abort: the async contract has no in-call wait — the pass is one
+		// tick, and the thunk must stay unevaluated for the whole of it
 		let hyprctlCalls = 0;
 		try {
 			const r = await dispatchTasks({
@@ -327,7 +389,6 @@ describe("spawn failure settles immediately (failed-to-spawn)", () => {
 					throw new Error("the bunBin thunk must not be evaluated in tile mode");
 				},
 				deps: deps({
-					signal: controller.signal,
 					hyprctl: async () => {
 						hyprctlCalls++;
 						return { code: 0, stdout: "", stderr: "" };
@@ -339,11 +400,11 @@ describe("spawn failure settles immediately (failed-to-spawn)", () => {
 			// Reaching the transport + no spawn-failed event proves the thunk
 			// stayed unevaluated.
 			expect(hyprctlCalls).toBeGreaterThan(0);
-			expect(r.aborted).toBe(true);
+			// the stub tile never ran a wrapper — the task stays queued, no settle
+			expect(r.results[0].state).toBe("queued");
 			const events = (await P.readEvents(join(tasksRoot, r.results[0].id))).map((e: Record<string, unknown>) => e.event);
 			expect(events).not.toContain("spawn-failed");
 		} finally {
-			clearTimeout(timer);
 			rmSync(localBin, { force: true });
 			// the tile task never settles (hyprctl was stubbed, no wrapper ran):
 			// remove it so the residual queued dir cannot consume a slot in the
@@ -354,6 +415,120 @@ describe("spawn failure settles immediately (failed-to-spawn)", () => {
 			}
 		}
 	});
+});
+
+// ---------------------------------------------------------------------------
+// the spawn pass's double-spawn guard (the pass consults the loop's guards)
+
+describe("the spawn pass's double-spawn guard (the pass consults the loop's guards)", () => {
+	it("a concurrent watcher that spawns the task first is not double-spawned by the pass (the no-double-spawn invariant)", async () => {
+		// The session's watcher (armed at session_start) ticks in the SAME
+		// process between the pass's awaits and can spawn a pass task before
+		// the pass's own issue reaches it: in tile mode each pass issue is
+		// slow (the join juggle + the delayed exec_cmd), so the watcher's
+		// ticks land inside the pass's issue windows. The pass must consult
+		// the loop's spawn guards (wrapper liveness + spawnInFlight) and
+		// skip a task whose spawn is already in flight — otherwise the task
+		// gets a second `spawn-issued` (bounded today by the wrapper's
+		// queued→running CAS — the loser exits handoff-lost — but the stated
+		// invariant is no double-spawn).
+		const localBinDir = join(process.env.HOME!, ".local", "bin");
+		mkdirSync(localBinDir, { recursive: true });
+		const localBin = join(localBinDir, "vitrine-run");
+		writeFileSync(localBin, "#!/bin/sh\nexit 0\n");
+		chmodSync(localBin, 0o755);
+		// a fresh tasks root: the watcher's live scope is the session's tasks
+		// (the shared root's leftovers would sit in it — and its own
+		// unspawned queue excludes itself from the slot count, so a foreign
+		// slot holder would starve the race)
+		const raceRoot = join(base, "race-tasks");
+		await mkdir(raceRoot, { recursive: true });
+		const prevRoot = process.env.VITRINE_TASKS_ROOT;
+		process.env.VITRINE_TASKS_ROOT = raceRoot;
+		// a pre-existing crashed task of this session: the watcher's loop
+		// stops on its first tick over an EMPTY scope (vacuously all
+		// terminal) — production arms the watcher where the session's
+		// tasks exist (session_start, or the dispatch's own re-arm). A
+		// terminal task holds no slot (the slot count is liveness-
+		// qualified), so it keeps the loop alive (the failing send keeps it
+		// pending) without starving the cap.
+		const gid = P.newTaskId();
+		const gdir = join(raceRoot, gid);
+		await P.createTask(
+			gdir,
+			{
+				task_id: gid,
+				agent: { name: "test-agent", body: "ghost body\n" },
+				dispatcher_session_id: info().sessionId,
+				cwd: base,
+				session_id: `vitrine.${gid}`,
+				session_name: `test-agent · ${gid.slice(0, 8)}`,
+				mode: "tile",
+				attended: false,
+				workspace: 9,
+				wall_timeout_s: 3600,
+				inactivity_s: 600,
+				auto_settle_s: 600,
+				auto_settle_grace_s: 60,
+				async: true,
+				created_at: new Date().toISOString(),
+				boot_id: P.currentBootId(),
+			},
+			"ghost prompt\n",
+		);
+		await writeFile(join(gdir, "result.md"), "ghost harvest\n");
+		await P.transitionState(gdir, "queued", "running", { started_at: new Date().toISOString() });
+		await P.transitionState(gdir, "running", "crashed", { finished_at: new Date().toISOString() });
+		// the watcher: fast ticks, fast (stub) tile issue — it spawns the
+		// pass's queued tasks during the pass's slow issue windows; the
+		// failing send keeps the ghost pending (the loop's alive clause)
+		const w = startSessionWatcher({
+			sessionId: info().sessionId,
+			send: () => Promise.reject(new Error("test send failure")),
+			replay: false,
+			tickMs: 50,
+			mode: "tile",
+			bunBin,
+			spawnDeps: { hyprctl: async () => ({ code: 0, stdout: "", stderr: "" }), mapWaitMs: 1, mapWaitTickMs: 1 },
+		});
+		try {
+			await new Promise((r) => setTimeout(r, 150)); // the watcher's first ticks land
+			const r = await dispatchTasks({
+				tasks: [1, 2].map((n) => ({ agent: "test-agent", task: `race ${n}` })),
+				mode: "tile",
+				dispatcher: info(),
+				bunBin,
+				deps: deps({
+					hyprctl: async (args) => {
+						// the pass's issue window is real: the exec_cmd dispatch
+						// (the spawn call) is delayed, the juggle's other
+						// hyprctl calls are fast
+						if (args.join(" ").includes("hl.dsp.exec_cmd")) await new Promise((res) => setTimeout(res, 1200));
+						return { code: 0, stdout: "", stderr: "" };
+					},
+					mapWaitMs: 400,
+					mapWaitTickMs: 50,
+				}),
+			});
+			// the pass and the watcher contested the same queued tasks (the
+			// pass's slow issue window is the race — each pass issue is 1.6 s,
+			// so the watcher's ticks land inside the windows); two tasks =
+			// the whole cap, so a contended task that the watcher issues first
+			// holds a slot (fresh owner lease) and the pass's guard must skip
+			// it — under the old unconditional issue the contended task would
+			// carry a second `spawn-issued` (the loser's wrapper would exit
+			// handoff-lost, but the stated invariant is no double-spawn)
+			for (const res of r.results) {
+				const dir = join(raceRoot, res.id);
+				const issued = (await P.readEvents(dir)).filter((e) => e.event === "spawn-issued");
+				expect(issued, `task ${res.id}`).toHaveLength(1);
+			}
+		} finally {
+			w.close();
+			process.env.VITRINE_TASKS_ROOT = prevRoot;
+			rmSync(localBin, { force: true });
+		}
+	}, 40_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -784,8 +959,8 @@ describe("join juggle through dispatchTasks (per-tile map-wait ordering, main-ag
 		const localBin = join(localBinDir, "vitrine-run");
 		writeFileSync(localBin, "#!/bin/sh\nexit 0\n");
 		chmodSync(localBin, 0o755);
-		const controller = new AbortController();
-		const timer = setTimeout(() => controller.abort(), 1500);
+		// no abort: the async pass spawns both tiles back-to-back (cap 2, no
+		// foreign) — the per-tile juggle ordering is asserted on the call log
 		try {
 			await dispatchTasks({
 				tasks: [{ agent: "test-agent", task: "first" }, { agent: "test-agent", task: "second" }],
@@ -793,7 +968,6 @@ describe("join juggle through dispatchTasks (per-tile map-wait ordering, main-ag
 				dispatcher: info(),
 				bunBin,
 				deps: deps({
-					signal: controller.signal,
 					hyprctl: wrapping,
 					tickMs: 50,
 					mapWaitMs: 400,
@@ -820,7 +994,6 @@ describe("join juggle through dispatchTasks (per-tile map-wait ordering, main-ag
 			expect(restoreIdxs).toHaveLength(2);
 			expect(restoreIdxs[1]).toBeGreaterThan(spawnIdxs[1]);
 		} finally {
-			clearTimeout(timer);
 			rmSync(localBin, { force: true });
 			// the tile tasks never settle (hyprctl was stubbed, no wrapper ran):
 			// remove them so the residual queued dirs cannot consume a slot
@@ -832,8 +1005,8 @@ describe("join juggle through dispatchTasks (per-tile map-wait ordering, main-ag
 	});
 });
 
-describe("admission + in-call queue (2+2, work-conserving)", () => {
-	it("the self-deadlock batch: 4 tasks, cap 2, no foreign — all four complete, two queued in-call", async () => {
+describe("admission + queue (2+2, work-conserving — the queue runs under the lease)", () => {
+	it("the work-conserving batch: 4 tasks, cap 2, no foreign — the pass admits 2, queues 2; the wait loop runs the queue", async () => {
 		const r = await dispatchTasks({
 			tasks: [1, 2, 3, 4].map((n) => ({ agent: "test-agent", task: `review ${n}` })),
 			mode: "headless",
@@ -841,18 +1014,31 @@ describe("admission + in-call queue (2+2, work-conserving)", () => {
 			bunBin,
 			deps: deps(),
 		});
+		// the R1 contract: the call returned AFTER the spawn/admission pass and
+		// BEFORE the first settlement — no harvest in the result (the harvest is
+		// reported on settlement, never in the tool result); 2 admitted
+		// (spawned now), 2 queued under the pass
 		expect(r.dispatched).toBe(4);
-		expect(r.results.every((x) => x.state === "completed")).toBe(true);
-		expect(r.results.filter((x) => x.queuedThisCall).length).toBe(2);
-		expect(r.queuedThisCall).toBe(2);
-		expect(r.text).toContain("queued this call");
-		// the clean fixture leaves no result.md — the harvest falls back to the
-		// session's last assistant text
-		expect(r.results.every((x) => x.result !== undefined && x.result.includes("fixture finished the work"))).toBe(true);
+		expect(r.queued).toBe(2);
+		expect(r.results.filter((x) => x.queued).length).toBe(2);
+		expect(r.results.every((x) => !P.isTerminal(x.state))).toBe(true); // returned before any settlement
+		expect(r.text).not.toContain("fixture finished the work"); // no harvest content in the result
+		// the wait loop (the watcher's mechanism, R2) runs the queue: as the two
+		// spawned tasks free their slots, the queued two spawn and complete
+		const w = await waitAll(r.results.map((x) => x.id));
+		expect(w.states.every((x) => x.state === "completed")).toBe(true);
+		expect(w.states.filter((x) => x.spawned).length).toBe(2); // the loop itself spawned the queued two
+		// the clean fixture leaves no result.md — the harvest (the delivery's
+		// mechanism) falls back to the session's last assistant text
+		const h = await harvestTask(join(tasksRoot, r.results[0].id), "completed", { tmpDir: join(base, "tmp") });
+		expect(h.text).toContain("fixture finished the work");
 		// spec-transport pin (v1.10): the config tunable rides spec.json —
 		// createTask fills it, the wrapper reads it from the spec
 		const firstSpec = await P.readSpec(join(tasksRoot, r.results[0].id));
 		expect(firstSpec.completed_close_s).toBe(600);
+		// the delivery-eligibility marker (R7): every task created from the
+		// async change onward carries async: true — the clean upgrade boundary
+		expect(firstSpec.async).toBe(true);
 	}, 60_000);
 
 	it("completed_close_s: 0 rides the spec (never auto-close)", async () => {
@@ -866,7 +1052,8 @@ describe("admission + in-call queue (2+2, work-conserving)", () => {
 				bunBin,
 				deps: deps(),
 			});
-			expect(r.results[0].state).toBe("completed");
+			const w = await waitAll(r.results.map((x) => x.id));
+			expect(w.states[0].state).toBe("completed");
 			const spec = await P.readSpec(join(tasksRoot, r.results[0].id));
 			expect(spec.completed_close_s).toBe(0);
 		} finally {
@@ -875,7 +1062,60 @@ describe("admission + in-call queue (2+2, work-conserving)", () => {
 		}
 	}, 60_000);
 
-	it("2 + in-call queue across a foreign running task; the foreign task is adopted", async () => {
+	it("thinking chain: per-call > agent frontmatter > omitted (no flag)", async () => {
+		const thinker = join(base, ".pi", "agent", "agents", "thinker.md");
+		await writeFile(thinker, "---\nname: thinker\ndescription: fixture thinker agent\nthinking: medium\n---\nbody\n");
+		try {
+			// no per-call thinking → the frontmatter value rides the spec
+			const r1 = await dispatchTasks({
+				tasks: [{ agent: "thinker", task: "frontmatter thinking" }],
+				mode: "headless",
+				dispatcher: info(),
+				bunBin,
+				deps: deps(),
+			});
+			expect((await waitAll(r1.results.map((x) => x.id))).states[0].state).toBe("completed");
+			expect((await P.readSpec(join(tasksRoot, r1.results[0].id))).agent.thinking).toBe("medium");
+			// the per-call value wins over the frontmatter
+			const r2 = await dispatchTasks({
+				tasks: [{ agent: "thinker", task: "per-call thinking", thinking: "max" }],
+				mode: "headless",
+				dispatcher: info(),
+				bunBin,
+				deps: deps(),
+			});
+			expect((await waitAll(r2.results.map((x) => x.id))).states[0].state).toBe("completed");
+			expect((await P.readSpec(join(tasksRoot, r2.results[0].id))).agent.thinking).toBe("max");
+		} finally {
+			rmSync(thinker, { force: true });
+		}
+	}, 60_000);
+
+	it("output_schema: the declared schema rides spec.json (typed harvest); a non-object is a bad-input", async () => {
+		const schema = { type: "object", properties: { verdict: { type: "string" } }, required: ["verdict"] };
+		const r = await dispatchTasks({
+			tasks: [{ agent: "test-agent", task: "schema ride", output_schema: schema }],
+			mode: "headless",
+			dispatcher: info(),
+			bunBin,
+			deps: deps(),
+		});
+		const w = await waitAll(r.results.map((x) => x.id));
+		expect(w.states[0].state).toBe("completed");
+		expect((await P.readSpec(join(tasksRoot, r.results[0].id))).output_schema).toEqual(schema);
+		// a non-object schema is a bad-input (rejected before any task dir exists)
+		await expect(
+			dispatchTasks({
+				tasks: [{ agent: "test-agent", task: "bad schema", output_schema: [1] as unknown as Record<string, unknown> }],
+				mode: "headless",
+				dispatcher: info(),
+				bunBin,
+				deps: deps(),
+			}),
+		).rejects.toMatchObject({ code: "bad-input" });
+	}, 60_000);
+
+	it("2 tasks across a foreign running task: 1 admitted, 1 queued; the queue runs when the slot frees", async () => {
 		const foreign = await spawnForeignRunning(3500);
 		try {
 			const r = await dispatchTasks({
@@ -885,12 +1125,16 @@ describe("admission + in-call queue (2+2, work-conserving)", () => {
 				bunBin,
 				deps: deps(),
 			});
-			expect(r.adopted.length).toBe(1);
-			expect(r.adopted[0].id).toBe(foreign.dir.split("/").pop()!);
-			expect(r.text).toContain("running from an earlier call");
-			// 1 slot free at admission: one spawns now, one queues and runs when the foreign one frees
-			expect(r.results.filter((x) => x.queuedThisCall).length).toBe(1);
-			expect(r.results.every((x) => x.state === "completed")).toBe(true);
+			// 1 slot free at admission: one spawns now, one queues under the pass
+			// (the foreign task is not ours to report — the old "adopted" report
+			// section is gone with the blocking call; the foreign keeps running
+			// under its own wrapper)
+			expect(r.queued).toBe(1);
+			expect(r.results.filter((x) => x.queued).length).toBe(1);
+			// the queue is live under the lease — the wait loop spawns the queued
+			// one when the foreign frees (~3.5 s)
+			const w = await waitAll(r.results.map((x) => x.id));
+			expect(w.states.every((x) => x.state === "completed")).toBe(true);
 		} finally {
 			try {
 				process.kill(foreign.pid, "SIGTERM");
@@ -902,15 +1146,17 @@ describe("admission + in-call queue (2+2, work-conserving)", () => {
 });
 
 describe("reconciliation through dispatch", () => {
-	it("the call's own in-call queue is never settled as stuck (a queue past the window is healthy; residue is not)", async () => {
-		// a foreign running task holds one slot, so the second task of the
-		// batch queues in-call. The injected clock fast-forwards 10 s per
-		// tick: by tick 2 the queued task's age (created_at vs now) is past
-		// the 15 s stuck window — without the exclusion, the dispatcher's
-		// own reconcile would settle its own healthy queue.
+	it("a queued task behind a slow worker survives past the 15 s stuck window (the lease-keyed predicate, R2)", async () => {
+		// A foreign running task holds one slot, so the second task of the
+		// batch queues under the pass. The injected clock fast-forwards 10 s
+		// per now() call: by the time the entry returns, the queued task's age
+		// (created_at vs now) is PAST the 15 s stuck window — and a direct
+		// reconcile must still leave it alone: its lease is fresh (written at
+		// creation with the same clock). The freshness is the key, not the age.
 		const foreign = await spawnForeignRunning(20_000);
-		// a backdated ghost queued task is residue: the SAME reconcile must
-		// still settle it (the exclusion is scoped to this call's own queue)
+		// A backdated ghost queued task with NO lease is residue: the same
+		// reconcile must still settle it (the lease gate is the only protection;
+		// the ghost has no owner)
 		const ghost = await createGhostTask();
 		const ghostSpec = await P.readSpec(ghost);
 		ghostSpec.created_at = new Date(Date.now() - 20_000).toISOString();
@@ -925,11 +1171,22 @@ describe("reconciliation through dispatch", () => {
 				bunBin,
 				deps: deps({ now }),
 			});
-			const queued = r.results.find((x) => x.queuedThisCall)!;
-			expect(queued.state).toBe("completed"); // it survived past the window and ran
-			const qEvents = await P.readEvents(join(tasksRoot, queued.id));
+			const queued = r.results.find((x) => x.queued)!;
+			expect(queued.state).toBe("queued"); // the pass queued it — the slot is held
+			const qdir = join(tasksRoot, queued.id);
+			// the queue's fake age is past the window; its lease is fresh — the
+			// reconcile must not settle it (the freshness key, not the age)
+			const stuck = await P.reconcileStuckQueued(qdir, { now: now() });
+			expect(stuck.settled).toBe("none");
+			expect(stuck.reason).toContain("lease fresh");
+			// the wait loop (same clock) refreshes the queue's lease every tick —
+			// it survives and runs when the foreign frees
+			const w = await waitAll(r.results.map((x) => x.id), { now });
+			expect(w.states.find((x) => x.id === queued.id)!.state).toBe("completed");
+			const qEvents = await P.readEvents(qdir);
 			expect(qEvents.some((e) => e.event === "transition" && e.from === "queued" && e.to === "crashed")).toBe(false);
-			// the residue was settled by the same call's reconcile
+			// the residue was settled by the entry's reconcile (no lease, past
+			// the window)
 			expect((await P.readState(ghost)).state).toBe("crashed");
 		} finally {
 			try {
@@ -967,39 +1224,46 @@ describe("reconciliation through dispatch", () => {
 		expect(st).toMatchObject({ state: "crashed", reason: "kill-requested" });
 	});
 
-	it("deferred harvest: a session's non-terminal-at-admission id is harvested on a later call", async () => {
-		// call 1: a hanging worker; the dispatcher aborts (the human gave up)
+	it("a dead worker's task settles crashed on the next call's reconcile (the delivery replaces the in-call deferred harvest)", async () => {
+		// call 1: a hanging worker — the tool returns after the spawn pass (the
+		// async contract: the turn never blocks, so no abort is needed to get
+		// out)
 		process.env.VITRINE_FIXTURE_MODE = "hang";
-		const ac = new AbortController();
-		setTimeout(() => ac.abort(), 800);
 		const r1 = await dispatchTasks({
 			tasks: [{ agent: "test-agent", task: "hang for me" }],
 			mode: "headless",
 			dispatcher: info(),
 			bunBin,
-			deps: deps({ signal: ac.signal, sleep: () => new Promise((r) => setTimeout(r, 150)) }),
+			deps: deps(),
 		});
 		process.env.VITRINE_FIXTURE_MODE = "clean";
-		expect(r1.aborted).toBe(true);
 		const t1 = r1.results[0];
-		expect(t1.state).not.toBe("completed");
+		expect(P.isTerminal(t1.state)).toBe(false); // the tool returned before settlement
+		// the wrapper boots and flips queued→running on its own; wait for that
+		// so the dead-wrapper rule (2) — not the stuck-queue rule (3) — settles
+		// the task after the kill
+		const t1dir = join(tasksRoot, t1.id);
+		for (let i = 0; i < 50 && (await P.readState(t1dir).catch(() => null))?.state !== "running"; i++) {
+			await new Promise((r) => setTimeout(r, 100));
+		}
 		// the worker hangs; kill the wrapper, then the worker (re-read — the
 		// wrapper may not have recorded it yet)
-		const t1dir = join(tasksRoot, t1.id);
-		const st1 = await P.readState(t1dir);
-		if (st1.wrapper_pid !== undefined) {
+		const st1 = await P.readState(t1dir).catch(() => null);
+		if (st1?.wrapper_pid !== undefined) {
 			try {
 				process.kill(st1.wrapper_pid, "SIGKILL");
 			} catch {}
 		}
 		await new Promise((r) => setTimeout(r, 200));
-		const st1b = await P.readState(t1dir).catch(() => st1);
-		if (st1b.worker_pid !== undefined) {
+		const st1b = await P.readState(t1dir).catch(() => null);
+		if (st1b?.worker_pid !== undefined) {
 			try {
 				process.kill(st1b.worker_pid, "SIGKILL");
 			} catch {}
 		}
-		// call 2 (same session): reconciliation settles it; the registry hits ⇒ deferred harvest
+		// call 2: the entry's reconcile settles the dead-wrapper case (rule 2);
+		// the crashed task's harvest is reported on settlement (the delivery),
+		// never carried in the tool result
 		const r2 = await dispatchTasks({
 			tasks: [{ agent: "test-agent", task: "next" }],
 			mode: "headless",
@@ -1007,24 +1271,24 @@ describe("reconciliation through dispatch", () => {
 			bunBin,
 			deps: deps(),
 		});
-		expect(r2.deferred.length).toBe(1);
-		expect(r2.deferred[0].id).toBe(t1.id);
-		expect(r2.deferred[0].state).toBe("crashed");
-		expect(r2.deferred[0].partial).toBe(true);
-		expect(r2.text).toContain("deferred harvest");
-		expect(pendingDispatchedIds("disp-test")).toEqual([]);
+		const st1c = await P.readState(t1dir);
+		expect(st1c.state).toBe("crashed");
+		expect(st1c.reason).toBe("dead-wrapper");
+		// call 2's own task completes under the wait loop
+		const w = await waitAll(r2.results.map((x) => x.id));
+		expect(w.states.every((x) => x.state === "completed")).toBe(true);
 	}, 60_000);
 
-	it("a foreign queued task that goes terminal DURING the call is deferred-harvested (cross-session)", async () => {
-		// a foreign queued task (another session's in-flight queue) — it is
-		// queued at admission (so it is snapshotted, not adopted as running),
-		// then goes terminal while this call waits ⇒ deferred harvest.
+	it("a foreign queued task that goes terminal in the background settles independently (cross-session)", async () => {
+		// a foreign queued task (another session's in-flight queue) — the tool
+		// no longer snapshots foreign queues (the blocking call's deferred
+		// harvest is gone with it); it just must not interfere: the foreign
+		// settles on its own while we wait for our own task.
 		const foreignDir = await createGhostTask();
 		const foreignId = P.taskIdOf(foreignDir);
-		// give it a result so the harvest has content
-		await P.writeResult(foreignDir, "foreign answer");
-		// the dispatched task keeps the call alive past the foreign transition
-		// (the in-place wrapper settles it on its own ~1 s tick)
+		// the foreign is young (no lease, inside the age grace) so neither the
+		// entry's nor the wait loop's reconcile touches it; the timer settles
+		// it (another session's bookkeeping)
 		const timer = setTimeout(async () => {
 			await P.transitionState(foreignDir, "queued", "crashed", {}, "foreign settled").catch(() => {});
 		}, 400);
@@ -1035,21 +1299,22 @@ describe("reconciliation through dispatch", () => {
 			bunBin,
 			deps: deps(),
 		});
-		clearTimeout(timer);
-		// the dispatched task is in results; the foreign one is deferred
-		const def = r.deferred.find((d) => d.id === foreignId);
-		expect(def).toBeDefined();
-		expect(def?.state).toBe("crashed");
-		expect(def?.result ?? "").toContain("foreign answer");
-		expect(r.adopted.find((a) => a.id === foreignId)).toBeUndefined();
+		const w = await waitAll(r.results.map((x) => x.id));
+		clearTimeout(timer); // the foreign settles in the background while we wait (the tool returned long before)
+		expect(w.states.every((x) => x.state === "completed")).toBe(true);
+		// the foreign settled with its own reason — untouched by us
+		const st = await P.readState(foreignDir);
+		expect(st.state).toBe("crashed");
+		expect(st.reason).toBe("foreign settled");
+		// and it never appears in our results
 		expect(r.results.find((x) => x.id === foreignId)).toBeUndefined();
 	}, 60_000);
 });
 
-describe("abort semantics", () => {
-	it("unspawned tasks settle never-spawned; spawned ones keep running", async () => {
+describe("abort semantics (the async contract: a turn abort never cancels the work)", () => {
+	it("an already-aborted signal skips the spawn pass (no work added to a dying turn)", async () => {
 		const ac = new AbortController();
-		setTimeout(() => ac.abort(), 500);
+		ac.abort();
 		const r = await dispatchTasks({
 			tasks: [1, 2, 3, 4].map((n) => ({ agent: "test-agent", task: `review ${n}` })),
 			mode: "headless",
@@ -1058,44 +1323,80 @@ describe("abort semantics", () => {
 			deps: deps({ signal: ac.signal }),
 		});
 		expect(r.aborted).toBe(true);
-		// two slots: two spawned (not yet terminal at abort), two never-spawned
-		const never = r.results.filter((x) => x.neverSpawned);
-		expect(never.length).toBe(2);
-		for (const x of never) {
-			const st = await P.readState(join(tasksRoot, x.id));
-			expect(st).toMatchObject({ state: "crashed", reason: "never-spawned" });
+		// nothing spawned: every task stays queued under its lease — the
+		// session's watcher owns it if the session lives; a dead session's
+		// stale lease settles it never-spawned (delivery is session-scoped,
+		// not turn-scoped)
+		expect(r.results.every((x) => x.state === "queued")).toBe(true);
+		expect(r.queued).toBe(4);
+		// the leases are written at creation — the queue is live, not residue
+		for (const x of r.results) {
+			expect(await P.readLease(join(tasksRoot, x.id))).not.toBeNull();
 		}
-		const spawned = r.results.filter((x) => !x.neverSpawned);
-		expect(spawned.length).toBe(2);
-		// they were actually launched (running or already completed)
+		// the pass added no work — nothing to kill; remove the dirs
+		for (const x of r.results) await P.removeTask(join(tasksRoot, x.id));
+	});
+
+	it("a dead owner's stale lease settles the queue never-spawned; the spawned workers run on", async () => {
+		const r = await dispatchTasks({
+			tasks: [1, 2, 3, 4].map((n) => ({ agent: "test-agent", task: `review ${n}` })),
+			mode: "headless",
+			dispatcher: info(),
+			bunBin,
+			deps: deps(),
+		});
+		expect(r.aborted).toBe(false);
+		const spawned = r.results.filter((x) => !x.queued);
+		const queued = r.results.filter((x) => x.queued);
+		expect(spawned.length).toBe(2); // cap 2, no foreign
+		expect(queued.length).toBe(2);
+		// the tool returned; the spawned two run on under their wrappers (the
+		// fixture completes on its own). Wait for them to settle.
+		for (let i = 0; i < 50; i++) {
+			const sts = await Promise.all(spawned.map((x) => P.readState(join(tasksRoot, x.id)).catch(() => null)));
+			if (sts.every((s) => s !== null && P.isTerminal(s.state))) break;
+			await new Promise((r) => setTimeout(r, 200));
+		}
 		for (const x of spawned) {
 			const st = await P.readState(join(tasksRoot, x.id));
-			expect(["queued", "running", "completed"]).toContain(st.state);
+			expect(st.state).toBe("completed");
 		}
-	}, 30_000);
+		// the dispatcher is dead (no watcher exists in this hermetic test to
+		// keep refreshing the queue's leases): 31 s past creation the leases
+		// are stale and the queue is a dead owner's residue — the stuck-queued
+		// rule settles it never-spawned
+		for (const x of queued) {
+			const dir = join(tasksRoot, x.id);
+			const res = await P.reconcileStuckQueued(dir, { now: Date.now() + 31_000 });
+			expect(res.settled).toBe("crashed");
+			expect(await P.readState(dir)).toMatchObject({ state: "crashed", reason: "never-spawned" });
+		}
+	}, 60_000);
 });
 
 describe("countSlots (liveness-qualified)", () => {
-	it("counts live running wrappers, young queued, and nothing else", () => {
+	it("counts live running wrappers, fresh-lease queued, and nothing else (the lease is the key)", () => {
 		const proc = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
 		proc.unref();
 		const live = P.pidInfo(proc.pid!);
 		const now = Date.now();
-		const young = new Date().toISOString();
-		const old = new Date(now - 60_000).toISOString();
+		const freshLease = new Date(now - 1_000).toISOString(); // the owner ticked 1 s ago
+		const staleLease = new Date(now - 45_000).toISOString(); // the owner stopped ticking
 		const n = countSlots(
 			[
 				{ dir: "/a", state: "running", wrapperPid: proc.pid, wrapperPidStart: live.startTime },
 				{ dir: "/b", state: "running", wrapperPid: proc.pid, wrapperPidStart: "recycled-start-time" },
 				{ dir: "/c", state: "running" },
 				{ dir: "/d", state: "queued", wrapperPid: proc.pid },
-				{ dir: "/e", state: "queued", createdAt: young },
-				{ dir: "/f", state: "queued", createdAt: old },
-				{ dir: "/g", state: "completed" },
+				{ dir: "/e", state: "queued", leaseUpdatedAt: freshLease },
+				{ dir: "/f", state: "queued", leaseUpdatedAt: staleLease },
+				{ dir: "/g", state: "queued", leaseUpdatedAt: null }, // no lease — a dead owner's residue
+				{ dir: "/h", state: "completed" },
 			],
 			now,
 		);
-		// a (live+start-match) + d (live wrapper) + e (young) = 3
+		// a (live+start-match) + d (live wrapper) + e (fresh lease — a live queue,
+		// whatever its creation age) = 3
 		expect(n).toBe(3);
 		process.kill(proc.pid!, "SIGTERM");
 	});
@@ -1126,6 +1427,29 @@ describe("harvest (caps + 0600 overflow)", () => {
 		const st = statSync(h.overflowFile!);
 		expect(st.mode & 0o777).toBe(0o600);
 		expect(await readFile(h.overflowFile!, "utf8")).toBe(full);
+	});
+
+	it("result.json: the typed data is harvested (machine-readable + compact JSON for the report)", async () => {
+		const data = { verdict: "pass", port: 8080 };
+		const dir = await terminalTaskDir({ "result.md": "the answer\n", "result.json": JSON.stringify(data, null, 2) + "\n" });
+		const h = await harvestTask(dir, "completed", { tmpDir: join(base, "tmp") });
+		expect(h.data).toEqual(data);
+		expect(h.dataText).toBe(JSON.stringify(data));
+		expect(h.overflowDataFile).toBeUndefined();
+	});
+
+	it("a >8KB result.json is capped, with the full data in a 0600 overflow file", async () => {
+		const data = { big: "x".repeat(9000), keep: "it" };
+		const full = JSON.stringify(data);
+		const dir = await terminalTaskDir({ "result.md": "the answer\n", "result.json": full + "\n" });
+		const h = await harvestTask(dir, "completed", { tmpDir: join(base, "tmp") });
+		expect(h.data).toEqual(data); // machine-readable stays uncapped
+		expect(h.dataText).toContain("[data capped");
+		expect(h.dataText).toContain(h.overflowDataFile!);
+		expect(h.dataText!.length).toBeLessThan(full.length);
+		const st = statSync(h.overflowDataFile!);
+		expect(st.mode & 0o777).toBe(0o600);
+		expect(await readFile(h.overflowDataFile!, "utf8")).toBe(full);
 	});
 
 	it("falls back to the session's last assistant text when result.md is absent", async () => {
@@ -1161,41 +1485,45 @@ describe("harvest (caps + 0600 overflow)", () => {
 	});
 });
 
-describe("result format (the shape)", () => {
+describe("result format (the R1 shape)", () => {
+	// The tool result carries NO harvest: per task — short id, agent, state
+	// (running/queued; crashed when the spawn failed in the pass) — and for
+	// every non-terminal task the one line stating the harvest will be
+	// reported on settlement.
 	const res: DispatchedTaskResult[] = [
-		{ id: "a1b2c3d4-0000-0000-0000-000000000001", agent: "refiner", state: "completed", elapsedMs: 252_000, result: "the verdict\nsecond line", sessionId: "vitrine.a1b2c3d4-0000-0000-0000-000000000001" },
-		{ id: "a1b2c3d4-0000-0000-0000-000000000002", agent: "executor", state: "crashed", reason: "never-spawned", elapsedMs: 4_000, result: "partial work", partial: true, sessionId: "vitrine.a1b2c3d4-0000-0000-0000-000000000002", queuedThisCall: true },
+		{ id: "a1b2c3d4-0000-0000-0000-000000000001", agent: "refiner", state: "running", sessionId: "vitrine.a1b2c3d4-0000-0000-0000-000000000001" },
+		{ id: "a1b2c3d4-0000-0000-0000-000000000002", agent: "executor", state: "queued", queued: true, sessionId: "vitrine.a1b2c3d4-0000-0000-0000-000000000002" },
+		{ id: "a1b2c3d4-0000-0000-0000-000000000003", agent: "executor", state: "crashed", reason: "failed-to-spawn", sessionId: "vitrine.a1b2c3d4-0000-0000-0000-000000000003" },
 	];
-	const text = renderReport({ mode: "tile", dispatched: 2, results: res, queuedThisCall: 1, adopted: [], deferred: [], aborted: false });
+	const text = renderDispatch({ dispatched: 3, results: res, aborted: false });
 
-	it("header: dispatched / succeeded / failed", () => {
-		expect(text.split("\n")[0]).toBe("2 dispatched · 1 succeeded, 1 failed");
+	it("header: the dispatched count + the non-blocking contract line", () => {
+		expect(text.split("\n")[0]).toBe("3 dispatched (non-blocking — each task's harvest will be reported on settlement, not in this result)");
 	});
 
-	it("per-task block: [n] agent · shortid — state (elapsed), indented body, session line", () => {
-		expect(text).toContain("[1] refiner · a1b2c3d4 — completed (4m12s)");
-		expect(text).toContain("    the verdict");
-		expect(text).toContain("    session vitrine.a1b2c3d4-0000-0000-0000-000000000001");
+	it("per-task line: [n] agent · shortid — state (no harvest content)", () => {
+		expect(text).toContain("[1] refiner · a1b2c3d4 — running — the harvest will be reported on settlement");
+		expect(text).toContain("[2] executor · a1b2c3d4 — queued — the harvest will be reported on settlement");
 	});
 
-	it("crashed tasks are labelled partial and named with the reason", () => {
-		expect(text).toContain("[2] executor · a1b2c3d4 — crashed (4s) (never-spawned) — partial");
+	it("a terminal task (the pass settled it) names state + reason, no settlement line", () => {
+		expect(text).toContain("[3] executor · a1b2c3d4 — crashed (failed-to-spawn)");
+		expect(text).not.toContain("crashed (failed-to-spawn) — the harvest");
 	});
 
-	it("the queued-this-call line", () => {
-		expect(text).toContain("1 queued this call, ran after slot freed: executor · a1b2c3d4 — crashed");
+	it("no harvest content ever lands in the result text", () => {
+		expect(text).not.toContain("the verdict");
+		expect(text).not.toContain("data:");
 	});
 
-	it("on abort, still-running tasks are counted separately, not as failures", () => {
+	it("on abort, the header names the skipped spawn pass (the tasks stay queued under their lease)", () => {
 		const abortedRes: DispatchedTaskResult[] = [
-			{ id: "a1b2c3d4-0000-0000-0000-000000000001", agent: "refiner", state: "completed", elapsedMs: 1000, sessionId: "vitrine.a1b2c3d4-0000-0000-0000-000000000001" },
-			{ id: "a1b2c3d4-0000-0000-0000-000000000002", agent: "executor", state: "running", elapsedMs: 1000, sessionId: "vitrine.a1b2c3d4-0000-0000-0000-000000000002" },
-			{ id: "a1b2c3d4-0000-0000-0000-000000000003", agent: "executor", state: "crashed", reason: "never-spawned", elapsedMs: 10, partial: true, sessionId: "vitrine.a1b2c3d4-0000-0000-0000-000000000003" },
+			{ id: "a1b2c3d4-0000-0000-0000-000000000001", agent: "refiner", state: "queued", queued: true, sessionId: "vitrine.a1b2c3d4-0000-0000-0000-000000000001" },
+			{ id: "a1b2c3d4-0000-0000-0000-000000000002", agent: "executor", state: "queued", queued: true, sessionId: "vitrine.a1b2c3d4-0000-0000-0000-000000000002" },
 		];
-		const t = renderReport({ mode: "headless", dispatched: 3, results: abortedRes, queuedThisCall: 0, adopted: [], deferred: [], aborted: true });
-		// 1 succeeded, 1 failed (the never-spawned), 1 still running — NOT 2 failed
-		expect(t.split("\n")[0]).toBe("3 dispatched · 1 succeeded, 1 failed, 1 still running · ABORTED (workers keep running)");
+		const t = renderDispatch({ dispatched: 2, results: abortedRes, aborted: true });
+		expect(t.split("\n")[0]).toBe(
+			"2 dispatched (non-blocking — each task's harvest will be reported on settlement, not in this result) · ABORTED (the spawn pass was skipped — the tasks stay queued under their lease)",
+		);
 	});
 });
-
-

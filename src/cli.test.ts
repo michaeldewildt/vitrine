@@ -7,14 +7,18 @@ import { describe, expect, it, beforeAll, afterAll } from "bun:test";
 import { writeFile } from "node:fs/promises";
 import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import * as P from "./protocol";
 import { runCli } from "./cli";
+
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 let base: string;
 let realHome: string;
 let realTasksRoot: string | undefined;
 let realSessionsDir: string | undefined;
+let realBenchHistory: string | undefined;
 const NOW = Date.parse("2026-09-16T12:00:00Z");
 
 function makeSpec(taskId: string, over: Partial<P.TaskSpec> = {}): P.TaskSpec {
@@ -52,9 +56,15 @@ beforeAll(async () => {
 	realHome = process.env.HOME ?? "";
 	realTasksRoot = process.env.VITRINE_TASKS_ROOT;
 	realSessionsDir = process.env.VITRINE_SESSIONS_DIR;
+	realBenchHistory = process.env.VITRINE_BENCH_HISTORY;
 	process.env.HOME = base;
 	process.env.VITRINE_TASKS_ROOT = join(base, "tasks");
 	process.env.VITRINE_SESSIONS_DIR = join(base, "sessions");
+	// The CLI-level `bench` tests run the full driver (hermetic + live) WITHOUT
+	// skipHistory. The history path is the one IO seam they leave behind — the
+	// drivers resolve it repo-relative, not through HOME — so point it at a tmp
+	// file: no test may touch the machine's history (the warn-gate baseline).
+	process.env.VITRINE_BENCH_HISTORY = join(base, "bench-history.jsonl");
 });
 
 afterAll(async () => {
@@ -63,6 +73,8 @@ afterAll(async () => {
 	else process.env.VITRINE_TASKS_ROOT = realTasksRoot;
 	if (realSessionsDir === undefined) delete process.env.VITRINE_SESSIONS_DIR;
 	else process.env.VITRINE_SESSIONS_DIR = realSessionsDir;
+	if (realBenchHistory === undefined) delete process.env.VITRINE_BENCH_HISTORY;
+	else process.env.VITRINE_BENCH_HISTORY = realBenchHistory;
 	await rm(base, { recursive: true, force: true });
 });
 
@@ -221,6 +233,26 @@ describe("gc", () => {
 		const r = await runCli(["gc"], { ...QUIET, now: () => NOW });
 		expect(r.lines).toContain("gc: nothing to remove");
 	});
+
+	it("an undelivered async task dir is never gc'd (the delivery owns it until the harvest-delivered marker) — and the skip is noted", async () => {
+		const dir = await newTask({ async: true });
+		await P.transitionState(dir, "queued", "running", {});
+		await P.transitionState(dir, "running", "completed", {}, "done");
+		// age it 15 days — past the retention window; without the skip it would be pruned
+		const st = await P.readState(dir);
+		st.finished_at = new Date(NOW - 15 * 24 * 3600 * 1000).toISOString();
+		await writeFile(join(dir, "state.json"), JSON.stringify(st, null, 2) + "\n");
+		const r = await runCli(["gc"], { ...QUIET, now: () => NOW });
+		expect(r.lines).toContain("gc: nothing to remove");
+		// the skip is noted in the output (R5): the dir is unretirable by gc until delivered
+		expect(r.lines.join("\n")).toContain("skipped 1 undelivered async task(s)");
+		expect(r.lines.join("\n")).toContain("vitrine_collect with the task id delivers and marks it");
+		// once the delivery writes the marker, the plain retention rule applies again (and the note is gone)
+		await P.writeHarvestDelivered(dir, "batch-x");
+		const r2 = await runCli(["gc"], { ...QUIET, now: () => NOW });
+		expect(r2.lines.join("\n")).toContain("removed " + P.taskIdOf(dir));
+		expect(r2.lines.join("\n")).not.toContain("skipped");
+	});
 });
 
 describe("gc --dry-run", () => {
@@ -360,4 +392,123 @@ describe("list --json", () => {
 		expect(r.code).toBe(2);
 		expect(errs.join(" ")).toContain("usage");
 	});
+});
+
+describe("bench", () => {
+	it("bench live --mode bogus / --mode (missing value) ⇒ usage, exit 2", async () => {
+		for (const argv of [
+			["bench", "live", "--mode", "bogus"],
+			["bench", "live", "--mode"],
+			["bench", "live", "--runs", "0"],
+		]) {
+			const errs: string[] = [];
+			const r = await runCli(argv, { ...QUIET, err: (l) => errs.push(l) });
+			expect(r.code).toBe(2);
+			expect(errs.join(" ")).toContain("usage: vitrine bench");
+		}
+	});
+
+	it("bench hermetic --mode ⇒ usage (headless-only), exit 2", async () => {
+		const errs: string[] = [];
+		const r = await runCli(["bench", "hermetic", "--mode", "headless"], { ...QUIET, err: (l) => errs.push(l) });
+		expect(r.code).toBe(2);
+		expect(errs.join(" ")).toContain("headless-only");
+	});
+
+	it("bench without a sub-verb ⇒ usage (stderr), exit 2", async () => {
+		const errs: string[] = [];
+		const r = await runCli(["bench"], { ...QUIET, err: (l) => errs.push(l) });
+		expect(r.code).toBe(2);
+		expect(errs.join(" ")).toContain("usage: vitrine bench");
+	});
+
+	it("bench hermetic --runs 0 / --runs abc / --runs (missing value) ⇒ usage, exit 2", async () => {
+		for (const argv of [["bench", "hermetic", "--runs", "0"], ["bench", "hermetic", "--runs", "abc"], ["bench", "hermetic", "--runs"]]) {
+			const r = await runCli(argv, QUIET);
+			expect(r.code).toBe(2);
+		}
+	});
+
+	it("bench hermetic --bogus ⇒ usage, exit 2", async () => {
+		const r = await runCli(["bench", "hermetic", "--bogus"], QUIET);
+		expect(r.code).toBe(2);
+	});
+
+	it("bench hermetic runs the driver and exits 0 (--json: one line of record JSON, no text report)", async () => {
+		const r = await runCli(["bench", "hermetic", "--runs", "1", "--json"], QUIET);
+		expect(r.code).toBe(0);
+		// --json: exactly one line — the history record (fixed shape)
+		expect(r.lines).toHaveLength(1);
+		const rec = JSON.parse(r.lines[0]) as Record<string, unknown>;
+		expect(rec.suite).toBe("hermetic");
+		expect((rec.params as Record<string, unknown>).runs).toBe(1);
+		expect(Array.isArray(rec.rows)).toBe(true);
+		expect(typeof (rec.medians as Record<string, unknown>).boot_ms).toBe("number");
+		expect(typeof (rec.medians as Record<string, unknown>).settle_ms).toBe("number");
+	}, 120_000);
+});
+
+describe("bench live (the flag surface + the CLI→driver chain against the fixture)", () => {
+	// The CLI runs the REAL driver against the REAL battery (three dispatches,
+	// one at a time) — under the test env (tmp HOME/tasks/sessions) with a
+	// fake-pi shim + the battery's seats, so no real model is touched. The
+	// fixture ignores prompts, so every oracle fails: the run is a
+	// success-0/3 REPORT — and the exit code stays 0 (the contract).
+	let shim: string;
+	let realPiBin: string | undefined;
+	// a fresh scratch tasks root: the earlier tests leave foreign running tasks
+	// (wrapper pid = the test process → live) in the shared root, and those
+	// would hold the slot cap — the driver would queue its tasks behind them
+	// forever. The bench describe runs on a clean root, like the gc --dry-run
+	// and list --json describes do.
+	let root: string;
+
+	beforeAll(async () => {
+		const { chmod, mkdir, writeFile } = await import("node:fs/promises");
+		const agents = join(base, ".pi", "agent", "agents");
+		await mkdir(agents, { recursive: true });
+		await writeFile(
+			join(agents, "explore.md"),
+			"---\nname: explore\ndescription: fixture read-only investigator for the bench live CLI test.\nmodel: ninfer/bench-model\n---\n# Explore\n\nFixture.\n",
+		);
+		await writeFile(
+			join(agents, "execute.md"),
+			"---\nname: execute\ndescription: fixture bounded implementer for the bench live CLI test.\nmodel: ninfer/bench-model\n---\n# Execute\n\nFixture.\n",
+		);
+		shim = join(base, "pi-shim");
+		await writeFile(shim, `#!/bin/sh\nexport VITRINE_FIXTURE_MODE=done\nexport VITRINE_FIXTURE_GAP_MS=30\nexec ${process.execPath} ${REPO_ROOT}/test/fixtures/fake-pi.ts "$@"\n`);
+		await chmod(shim, 0o755);
+		realPiBin = process.env.VITRINE_PI_BIN;
+		process.env.VITRINE_PI_BIN = shim;
+		root = await mkdtemp(join(tmpdir(), "vitrine-cli-benchlive-"));
+		process.env.VITRINE_TASKS_ROOT = root;
+	});
+
+	afterAll(async () => {
+		if (realPiBin === undefined) delete process.env.VITRINE_PI_BIN;
+		else process.env.VITRINE_PI_BIN = realPiBin;
+		process.env.VITRINE_TASKS_ROOT = join(base, "tasks");
+		await rm(root, { recursive: true, force: true });
+	});
+
+	it("bench live --runs 1 --mode headless runs the battery and exits 0 (the failed oracles are a report)", async () => {
+		const r = await runCli(["bench", "live", "--runs", "1", "--mode", "headless"], QUIET);
+		expect(r.code).toBe(0);
+		const text = r.lines.join("\n");
+		expect(text).toContain("vitrine bench live — 1 runs · mode headless · battery: read-ground, bounded-write, decode-proxy");
+		expect(text).toContain("success 0/3"); // the fixture cannot satisfy the real oracles
+		expect(text).toContain("failures (3):");
+		expect(text).toContain("oracle:");
+	}, 120_000);
+
+	it("bench live --json: one line of the live history record, no text report", async () => {
+		const r = await runCli(["bench", "live", "--runs", "1", "--mode", "headless", "--json"], QUIET);
+		expect(r.code).toBe(0);
+		expect(r.lines).toHaveLength(1);
+		const rec = JSON.parse(r.lines[0]) as Record<string, unknown>;
+		expect(rec.suite).toBe("live");
+		expect(rec.params).toEqual({ runs: 1, mode: "headless", battery: ["read-ground", "bounded-write", "decode-proxy"] });
+		expect((rec.rows as unknown[]).length).toBe(3);
+		expect((rec.medians as Record<string, unknown>).e2e_ms).toBe(null); // no successful runs ⇒ null medians
+	}, 120_000);
 });

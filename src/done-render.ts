@@ -25,6 +25,8 @@ import type { RenderTheme, ToolRenderOptions, TuiComponent } from "@earendil-wor
 export interface DoneToolDetails {
 	/** The recorded answer — the exact text written to result.md. */
 	answer: string;
+	/** True when the typed data payload was recorded to result.json (the typed harvest). */
+	dataRecorded?: boolean;
 }
 
 /** The component factories the renderer needs (vitrine.ts wires pi-tui +
@@ -47,6 +49,12 @@ function answerOf(details: unknown): string | null {
 	if (typeof details !== "object" || details === null) return null;
 	const a = (details as { answer?: unknown }).answer;
 	return typeof a === "string" && a.trim() !== "" ? a : null;
+}
+
+/** Whether the result's `details` mark the typed data payload as recorded. */
+function dataRecordedOf(details: unknown): boolean {
+	if (typeof details !== "object" || details === null) return false;
+	return (details as { dataRecorded?: unknown }).dataRecorded === true;
 }
 
 /** The `vitrine_done` renderCall/renderResult pair (v1.14). */
@@ -82,8 +90,10 @@ export function makeDoneRenderers(deps: DoneRenderDeps) {
 		const answer = answerOf(result.details);
 		if (answer === null) return deps.text(theme.fg("warning", "no answer recorded (empty)"), PAD, PAD);
 		const header = deps.text(theme.fg("success", `✓ answer recorded (${answer.length} chars)`), PAD, PAD);
+		// the typed-harvest note — one line, only when data was recorded
+		const dataNote = dataRecordedOf(result.details) ? deps.text(theme.fg("success", "✓ data recorded (result.json)"), PAD, PAD) : null;
 		const body = deps.markdown(answer, PAD, PAD, deps.markdownTheme());
-		return deps.container([header, body]);
+		return deps.container(dataNote === null ? [header, body] : [header, dataNote, body]);
 	}
 
 	return { renderCall, renderResult };

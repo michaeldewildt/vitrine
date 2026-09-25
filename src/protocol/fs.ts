@@ -159,6 +159,38 @@ export async function readEvents(dir: string): Promise<Array<Record<string, unkn
 		});
 }
 
+// ---------------------------------------------------------------------------
+// harvest-delivered (the delivery marker)
+
+/**
+ * Write the `harvest-delivered` event — the delivery marker. One per
+ * delivered task; `id` is the delivery-batch id shared by all tasks in one
+ * message, so a message's membership is reconstructable from disk. Written
+ * after a successful send (the watcher/collect delivery), never before. The
+ * marker is write-once: a task that already carries the event is untouched
+ * (returns `false`) — the at-least-once crash window is bounded to the
+ * send→write gap.
+ */
+export async function writeHarvestDelivered(dir: string, batchId: string): Promise<boolean> {
+	const d = await assertTaskDir(dir);
+	if ((await readEvents(d)).some((e) => e.event === "harvest-delivered")) return false;
+	await appendEvent(d, { event: "harvest-delivered", id: batchId });
+	return true;
+}
+
+/**
+ * The delivery-batch id of the first `harvest-delivered` event, or `null`
+ * when absent — **absence = undelivered**: the replay predicate (terminal +
+ * spec-`async` + no marker) and the gc-skip predicate key on this. A
+ * malformed line with a non-string `id` degrades to undelivered (the marker
+ * is not trusted over its own shape).
+ */
+export async function harvestDeliveredId(dir: string): Promise<string | null> {
+	const d = await assertTaskDir(dir);
+	const e = (await readEvents(d)).find((ev) => ev.event === "harvest-delivered");
+	return e !== undefined && typeof e.id === "string" ? e.id : null;
+}
+
 /** The wrapper's own stderr + the worker's stderr (`tail.log`). */
 export async function appendTail(dir: string, text: string): Promise<void> {
 	const d = await assertTaskDir(dir);

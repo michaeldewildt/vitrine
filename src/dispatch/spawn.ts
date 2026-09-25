@@ -1,12 +1,16 @@
 /**
  * spawn.ts — the dispatch-side spawn construction: the
- * tile-spawn argv (the invariant) + the join juggle (v1.9 grouping), the
- * headless bun-bin resolution, and the small shared formatting pieces
- * (prompt header, elapsed, short id — used by the core + the report).
+ * tile-spawn argv (the invariant) + the join juggle (v1.9 grouping),
+ * `issueSpawn` (the shared spawn dispatch: tile or headless, with the
+ * immediate failure settle), the headless bun-bin resolution, and the
+ * small shared formatting pieces (prompt header, elapsed, short id — used
+ * by the core + the report + the wait loop).
  */
+import { spawn } from "node:child_process";
 import { statSync } from "node:fs";
 import { basename, isAbsolute, join } from "node:path";
 import * as C from "../config";
+import * as P from "../protocol";
 import {
 	focusWindowByPid,
 	listAllWindows,
@@ -49,6 +53,99 @@ export function formatElapsed(ms: number): string {
 export function tileSpawnArgv(agentName: string, taskId: string, runPath: C.RunPath, taskDir: string): string[] {
 	const cmd = [runPath.command, ...runPath.args, taskDir].join(" ");
 	return ["dispatch", `hl.dsp.exec_cmd("foot -T '${agentName} ${shortId(taskId)}' --app-id ${WORKER_APP_ID} -- ${cmd}")`];
+}
+
+/** The spawn transport environment (the entry's spawn pass and the wait
+ * loop share it — the spawn decision is one code path, R1/R2). */
+export interface SpawnEnv {
+	/** The spawn shape — decided by the compositor probe (tile if reachable, headless otherwise; never the reverse). */
+	mode: "tile" | "headless";
+	cfg: C.VitrineConfig;
+	/** The dispatcher's own bun binary (absolute). THUNK — headless only; tile never evaluates it (the tile needs a direct executable, and the compositor's `sh -c` layer cannot be trusted to resolve `bun`). */
+	bunBin: () => string;
+	hyprctl: (args: string[]) => Promise<HyprctlResult>;
+	sleep: (ms: number) => Promise<void>;
+	now: () => number;
+	mapWaitMs: number;
+	mapWaitTickMs: number;
+	panel?: PanelDeps;
+}
+
+/** One task's spawn identity (id + dir + the tile-title agent name + the spec's cwd for the headless spawn). */
+export interface SpawnTarget {
+	id: string;
+	dir: string;
+	agentName: string;
+	spec: P.TaskSpec;
+}
+
+/**
+ * Issue the spawn command for one task and settle the failure immediately:
+ * tile — the hyprctl dispatch through the main-agent join juggle; headless —
+ * the detached wrapper spawn. A spawn-command failure settles the task
+ * crashed/failed-to-spawn NOW (no waiting out the stuck window for a task
+ * that is known not to have launched). Returns whether the spawn command
+ * was issued: a code-1 hyprctl is a failed issue, not a throw — the
+ * `spawn-failed` event marks the throw/catch path only (e.g. a broken
+ * run-path resolution), `failed-to-spawn` the settle.
+ *
+ * The `spawn-issued` event is written BEFORE the spawn issues: the event is
+ * the double-spawn guard for a concurrently-attaching wait loop, and the
+ * issue window is real (the tile join's map-wait runs 1–2 s) — a loop
+ * attaching mid-issue must see the guard, not a bare `queued` state with no
+ * record. A failed issue then settles failed-to-spawn, so the stale event
+ * is inert: a settled task is terminal, and the guard only reads `queued`
+ * tasks. If the event itself cannot be written, the guard cannot be claimed
+ * — fail conservative (no spawn, settle failed-to-spawn): a silently
+ * dropped guard risks a double spawn for the whole boot window.
+ */
+export async function issueSpawn(target: SpawnTarget, env: SpawnEnv): Promise<boolean> {
+	const doSpawn = async (): Promise<boolean> => {
+		try {
+			if (env.mode === "tile") {
+				// Tile mode needs a direct executable and never uses the bun
+				// binary, so the `bunBin` thunk is NOT evaluated here (a broken
+				// headless-box bun PATH must not break tiling).
+				const runPath = C.resolveRunPath(env.cfg, "tile");
+				const argv = tileSpawnArgv(target.agentName, target.id, runPath, target.dir);
+				const { spawnOk } = await spawnTileWithJoin(
+					async () => (await env.hyprctl(argv)).code === 0,
+					{ hyprctl: env.hyprctl, sleep: env.sleep, now: env.now, mapWaitMs: env.mapWaitMs, mapWaitTickMs: env.mapWaitTickMs, panel: env.panel },
+				);
+				return spawnOk;
+			}
+			const runPath = C.resolveRunPath(env.cfg, "headless", env.bunBin());
+			const child = spawn(runPath.command, [...runPath.args, target.dir], {
+				cwd: target.spec.cwd,
+				env: { ...process.env, ...C.wrapperRootEnv(env.cfg) },
+				detached: true,
+				stdio: "ignore",
+			});
+			child.unref();
+			return true;
+		} catch (e: unknown) {
+			await P.appendEvent(target.dir, { event: "spawn-failed", source: "dispatch", error: String(e) });
+			return false;
+		}
+	};
+	// The spawn-issued record BEFORE the issue (the double-spawn guard — see
+	// the module comment above). A failed append fails the spawn conservative.
+	const guarded = await P.appendEvent(target.dir, { event: "spawn-issued", source: "dispatch" }).then(() => true).catch(() => false);
+	if (!guarded) {
+		await P.transitionState(target.dir, "queued", "crashed", {}, "failed-to-spawn").catch(() => null);
+		await P.appendEvent(target.dir, { event: "spawn-guard-write-failed", source: "dispatch" }).catch(() => null);
+		return false;
+	}
+	const ok = await doSpawn();
+	if (!ok) {
+		// A failed read of the state (the dir vanished) keeps the settle as a
+		// no-op — the event still records the failure. The (now pre-issue)
+		// spawn-issued event stays in the log: inert — the task is terminal
+		// and the guard only applies to queued tasks.
+		await P.transitionState(target.dir, "queued", "crashed", {}, "failed-to-spawn").catch(() => null);
+		await P.appendEvent(target.dir, { event: "failed-to-spawn", source: "dispatch" });
+	}
+	return ok;
 }
 
 export interface TileJoinDeps {
