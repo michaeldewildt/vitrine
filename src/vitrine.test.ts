@@ -80,6 +80,9 @@ beforeAll(async () => {
 	await writeFile(coOwnerPath, "// another extension's entry file (cutover fixture)\n");
 	process.env.VITRINE_PI_BIN = fakePiBin;
 	process.env.VITRINE_BUN_BIN = process.execPath;
+	// The real wrapper subprocess the E2E spawns inherits the test's env —
+	// a fast tick keeps it off the production 1000 ms/poll.
+	process.env.VITRINE_TICK_MS = "30";
 });
 
 afterAll(async () => {
@@ -90,6 +93,7 @@ afterAll(async () => {
 	delete process.env.VITRINE_SESSIONS_DIR;
 	delete process.env.VITRINE_BUN_BIN;
 	delete process.env.VITRINE_PI_BIN;
+	delete process.env.VITRINE_TICK_MS;
 	await rm(base, { recursive: true, force: true });
 });
 
@@ -187,6 +191,12 @@ function fakeCtx(over: Partial<ExtensionToolContext> = {}): ExtensionToolContext
 		ui: { notify: () => {} },
 		...over,
 	};
+}
+
+/** Poll `pred` on a short tick until it holds (the deadline is the original fixed sleep); the following assertion is the check. */
+async function pollUntil(pred: () => boolean, timeoutMs: number, tickMs = 20): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline && !pred()) await new Promise((r) => setTimeout(r, tickMs));
 }
 
 describe("worker mode (exactly one tool)", () => {
@@ -765,7 +775,7 @@ describe("dispatcher mode (cutover + the dispatch tool)", () => {
 			fake.fire();
 			// the production tick is 1000 ms — the replay delivery lands well inside
 			// the wait (the first loop pass runs before the first tick sleep)
-			await new Promise((r) => setTimeout(r, 2500));
+			await pollUntil(() => fake.sentMessages.length === 1, 2500);
 			expect(fake.sentMessages).toHaveLength(1);
 			const { message, options } = fake.sentMessages[0] as { message: { customType: string; content: string }; options: Record<string, unknown> };
 			expect(message.customType).toBe("vitrine-harvest");
@@ -773,9 +783,12 @@ describe("dispatcher mode (cutover + the dispatch tool)", () => {
 			expect(message.content).toContain("replay: the session restarted"); // undelivered at session start
 			expect(options).toEqual({ deliverAs: "followUp", triggerTurn: true });
 			expect(await P.harvestDeliveredId(dir)).toBeTruthy(); // the marker is written after the send
-			// session shutdown → the watcher closes (no send after it)
+			// session shutdown → the watcher closes (no send after it) — a NEGATIVE window:
+			// nothing positive to poll, so a real wait (the danger window is an in-flight
+			// iteration that passed the closed-check before shutdown fired — milliseconds,
+			// so 300 ms is ample where the original 1200 ms was conservative)
 			fake.fireShutdown();
-			await new Promise((r) => setTimeout(r, 1200));
+			await new Promise((r) => setTimeout(r, 300));
 			expect(fake.sentMessages).toHaveLength(1);
 		} finally {
 			process.env.VITRINE_TASKS_ROOT = realRoot;
@@ -824,7 +837,7 @@ describe("dispatcher mode (cutover + the dispatch tool)", () => {
 			// the FORKED session start (previousSessionFile → the ancestry + the replay arm)
 			await fake.fire({ reason: "fork", previousSessionFile: preForkFile });
 			// the replay is the arm's OWN message (immediately at arm) — lands well inside the wait
-			await new Promise((r) => setTimeout(r, 2500));
+			await pollUntil(() => fake.sentMessages.length === 1, 2500);
 			expect(fake.sentMessages).toHaveLength(1);
 			const { message, options } = fake.sentMessages[0] as { message: { customType: string; content: string; details: { replay: boolean; batch: string } }; options: Record<string, unknown> };
 			expect(message.customType).toBe("vitrine-harvest");

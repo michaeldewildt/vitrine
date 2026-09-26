@@ -61,6 +61,18 @@ import { runHeadlessWrapper, runWrapper } from "./wrapper/lifecycle";
 // The default sessions root is read at call time.
 const defaultSessionsRoot = (): string => join(homedir(), ".pi", "agent", "sessions");
 
+/**
+ * The wrapper tick (ms) from the environment: the E2E suites set
+ * VITRINE_TICK_MS low so a real wrapper subprocess settles without paying
+ * the production 1000 ms/poll (a subprocess can't take injected deps the
+ * way the in-process tests do). Absent / non-numeric / non-positive ⇒ 1000
+ * (fail to production, never to zero).
+ */
+export function tickMsFromEnv(env: Record<string, string | undefined> = process.env): number {
+	const n = Number(env.VITRINE_TICK_MS);
+	return Number.isFinite(n) && n > 0 ? n : 1000;
+}
+
 if (isMainModule(import.meta.url)) {
 	const dir = process.argv[2];
 	if (!dir || !isAbsolute(resolve(dir))) {
@@ -71,6 +83,10 @@ if (isMainModule(import.meta.url)) {
 		piBin: process.env.VITRINE_PI_BIN ?? "pi",
 		sessionsRoot: process.env.VITRINE_SESSIONS_DIR ?? defaultSessionsRoot(),
 		agentsDir: process.env.VITRINE_AGENTS_DIR ?? wrapperAgentsDir(),
+		// The wrapper's tick — the subprocess's override seam
+		// (VITRINE_TICK_MS): the E2E suites set it low; production (absent)
+		// runs the 1000 default.
+		tickMs: tickMsFromEnv(),
 	};
 	try {
 		// Mode is the protocol's decision: spec.mode selects the

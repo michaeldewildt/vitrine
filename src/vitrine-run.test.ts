@@ -51,6 +51,7 @@ import {
 	runWrapper,
 	sessionDirFor,
 	spawnWorkerHandle,
+	tickMsFromEnv,
 	totalCostUsd,
 	VITRINE_CONTRACT,
 	type HeadlessDeps,
@@ -133,6 +134,19 @@ describe("session-dir slug (pinned against real-pi dirs)", () => {
 	it("matches the observed ~/.pi/agent/sessions layout", () => {
 		expect(sessionDirFor("/home/mikey/Work", "/sessions")).toBe("/sessions/--home-mikey-Work--");
 		expect(sessionDirFor("/tmp/vitrine-u2", "/sessions")).toBe("/sessions/--tmp-vitrine-u2--");
+	});
+});
+
+describe("tickMsFromEnv (the wrapper's VITRINE_TICK_MS override)", () => {
+	it("absent or invalid → 1000 (fail to production, never to zero)", () => {
+		expect(tickMsFromEnv({})).toBe(1000);
+		expect(tickMsFromEnv({ VITRINE_TICK_MS: "" })).toBe(1000);
+		expect(tickMsFromEnv({ VITRINE_TICK_MS: "abc" })).toBe(1000);
+		expect(tickMsFromEnv({ VITRINE_TICK_MS: "0" })).toBe(1000);
+		expect(tickMsFromEnv({ VITRINE_TICK_MS: "-5" })).toBe(1000);
+	});
+	it("a valid value → the value", () => {
+		expect(tickMsFromEnv({ VITRINE_TICK_MS: "30" })).toBe(30);
 	});
 });
 

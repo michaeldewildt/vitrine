@@ -85,12 +85,16 @@ beforeAll(async () => {
 	writeFileSync(fakePiBin, `#!/bin/sh\nexec ${bunBinPath} ${fixturePi} "$@"\n`);
 	chmodSync(fakePiBin, 0o755);
 	process.env.VITRINE_PI_BIN = fakePiBin;
+	// The real wrapper subprocesses the headless E2Es spawn inherit the
+	// test's env — a fast tick keeps them off the production 1000 ms/poll.
+	process.env.VITRINE_TICK_MS = "30";
 });
 
 afterAll(async () => {
 	process.env.HOME = realHome;
 	delete process.env.VITRINE_SESSIONS_DIR;
 	delete process.env.VITRINE_PI_BIN;
+	delete process.env.VITRINE_TICK_MS;
 	if (process.env.VITRINE_KEEP_BASE) {
 		console.log(`[debug] keeping base: ${base}`);
 		return;
