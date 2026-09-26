@@ -787,7 +787,17 @@ describe("the session-scoped watcher — delivery", () => {
 		try {
 			const send = makeSend(); // the transport always SUCCEEDS
 			const tickMs = 50;
-			const w = startSessionWatcher({ sessionId: sid, send: send.fn, replay: false, tickMs });
+			// logical clock (the watcher's injectable now/sleep): the give-up backoff
+			// elapses in protocol time — the loop's own tick sleep advances the clock
+			// — so the five attempts don't pay wall backoff (the failed-send test
+			// above is the single genuine wall-clock backoff pin)
+			let fakeNow = Date.now();
+			const now = () => fakeNow;
+			const sleep = (ms: number) => {
+				fakeNow += ms;
+				return Promise.resolve();
+			};
+			const w = startSessionWatcher({ sessionId: sid, send: send.fn, replay: false, tickMs, now, sleep });
 			await watchStops(w, 30_000); // the stop condition applies once the task is given up
 			// the re-sends are bounded by the give-up (five attempts total), not unbounded
 			expect(send.attempts).toBe(MAX_SEND_ATTEMPTS);
@@ -807,10 +817,20 @@ describe("the session-scoped watcher — delivery", () => {
 		const sid = "w-giveup-rearm";
 		const id = await settleCompleted(P.newTaskId(), "the give-up answer\n", { dispatcher_session_id: sid });
 		const tickMs = 50;
+		// logical clock shared by both cycles: the give-up backoff elapses in
+		// protocol time — the loop's own tick sleep advances the clock — so the
+		// attempts don't pay wall backoff (the failed-send test above is the
+		// single genuine wall-clock backoff pin)
+		let fakeNow = Date.now();
+		const now = () => fakeNow;
+		const sleep = (ms: number) => {
+			fakeNow += ms;
+			return Promise.resolve();
+		};
 		// cycle 1: a persistently failing transport — five attempts, then give-up
 		const send1 = makeSend();
 		send1.failNext = 100;
-		const w1 = startSessionWatcher({ sessionId: sid, send: send1.fn, replay: false, tickMs });
+		const w1 = startSessionWatcher({ sessionId: sid, send: send1.fn, replay: false, tickMs, now, sleep });
 		await watchStops(w1, 30_000);
 		expect(send1.attempts).toBe(MAX_SEND_ATTEMPTS);
 		expect(await P.harvestDeliveredId(join(tasksRoot, id))).toBeNull();
@@ -818,7 +838,7 @@ describe("the session-scoped watcher — delivery", () => {
 		// the same session: the give-up must survive (no five fresh attempts)
 		const send2 = makeSend();
 		send2.failNext = 100;
-		const w2 = startSessionWatcher({ sessionId: sid, send: send2.fn, replay: false, tickMs });
+		const w2 = startSessionWatcher({ sessionId: sid, send: send2.fn, replay: false, tickMs, now, sleep });
 		await watchStops(w2, 5_000); // stops at once — the given-up task is not pending
 		expect(send2.attempts).toBe(0); // no re-attempt across the re-arm
 		expect(send2.sent).toHaveLength(0);
