@@ -67,9 +67,9 @@ const doneRenderers = makeDoneRenderers(doneRenderDeps);
  * are appended at load (see `composeDispatchDescription`). */
 const DISPATCH_MECHANICS =
 	"Dispatch one or more tasks to specialist agents (pi agent files), each in its own visible workspace " +
-	"(a Hyprland/foot tile when the compositor is reachable, otherwise a headless background worker). " +
+	"(a Hyprland/foot tile when the compositor is reachable, otherwise a headless worker). " +
 	"Returns immediately after the spawn/admission pass — per task: short id, agent, and state (running or " +
-	"queued). pi's docs call starting a new agent 'spawn' — this is that spawn: it starts one worker per task and dispatches the task to it.";
+	"queued).";
 
 /**
  * The `vitrine_collect` mechanics (R9): the pull-floor doctrine — dispatch
@@ -80,18 +80,15 @@ const DISPATCH_MECHANICS =
  * section bounds).
  */
 const COLLECT_MECHANICS =
-	"Pull vitrine results on demand — the pull floor that complements vitrine_dispatch, which returns immediately (ids + state, no harvest) " +
-	"and delivers each task's harvest on settlement; this tool is how you get a result when you want it now. " +
-	"It answers immediately from disk and NEVER blocks on a running worker — so never busy-poll collect inside a turn to wait a worker out; " +
-	"the delivery is the result path.\n" +
+	"Pull vitrine results on demand — the complement to vitrine_dispatch (which returns immediately and delivers each harvest on settlement); " +
+	"the way to get a result when you want it now. It answers immediately from disk and NEVER blocks on a running worker — " +
+	"never busy-poll collect inside a turn; the delivery is the result path.\n" +
 	"Per task: terminal → the full harvest in the fixed wrapper (capped — the 0600 overflow file's path is named in the body, and reading it " +
 	"is the sanctioned response to a truncated body) + delivery status; running/queued → a status line (state, elapsed, workspace) with no body; " +
 	"a terminal task a human resumed in its tile → the session's latest output as an advisory note (never a state change, never a re-delivery).\n" +
-	"No ids = all tasks of this session plus its fork ancestry (the pre-fork dispatcher's tasks). ids = explicit task ids (full, or the short " +
-	"8-char prefix from the dispatch return) — they cross any session.\n" +
-	"A collect that harvests a terminal task writes the harvest-delivered marker (a fresh collect-scoped batch id) — the collect is a delivery " +
-	"to this session's context, so replay and gc treat the task as delivered. Undelivered attended tasks are headlined without a body — " +
-	"attended workspaces are the human's; pulling their harvest is an explicit id.";
+	"No ids = all tasks of this session plus its fork ancestry; explicit ids (full or the short 8-char prefix) cross any session.\n" +
+	"Harvesting a terminal task writes the harvest-delivered marker — replay and gc treat the task as delivered. " +
+	"Undelivered attended tasks are headlined without a body — attended workspaces are the human's; pulling their harvest is an explicit id.";
 
 /**
  * Compose the `vitrine_dispatch` description:
