@@ -18,4 +18,6 @@ jobs:
       - name: Typecheck (strict tsc)
         run: bun run typecheck
       - name: Test (hermetic suite)
-        run: bun test
+        run: bun run test
+      - name: Test (bench suite)
+        run: bun run test:bench

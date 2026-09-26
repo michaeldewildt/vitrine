@@ -15,7 +15,8 @@
     ]
   },
   "scripts": {
-    "test": "bun test",
+    "test": "bun test src --path-ignore-patterns 'src/bench/*.test.ts'",
+    "test:bench": "bun test src/bench",
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
