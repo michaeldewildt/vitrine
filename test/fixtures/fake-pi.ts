@@ -53,6 +53,10 @@ for (let i = 0; i < args.length; i++) {
 	else if (a === "--fork") cfg.fork = args[++i];
 	else if (a === "--session-dir") cfg.sessionDir = args[++i];
 	else if (a === "--model" || a === "--thinking" || a === "--tools" || a === "--append-system-prompt") i++;
+	else if (a === "--no-tools") {
+		// boolean (zero tools) — tolerated, not honoured (the fixture never
+		// calls a tool)
+	}
 	else if (a === "--print") cfg.print = true;
 	else if (a === "--") {
 		const p = args[i + 1] ?? "";

@@ -22,9 +22,9 @@
  * 1. read + validate spec.json; queued → running with the CAS hand-off
  *    (records wrapper_pid + wrapper_pid_start + foot_pid — the hand-off
  *    lost to a sibling is `handoff-lost`, never a double spawn);
- * 2. build the worker argv/env from spec.json (the `--tools` ceiling —
- *    the agent's non-empty tools list, deduped; no flag on an empty or
- *    absent list);
+ * 2. build the worker argv/env from spec.json (the tools encoding — a
+ *    non-empty list ⇒ the `--tools` ceiling (deduped, verbatim); the empty
+ *    list (noTools) ⇒ `--no-tools` (zero tools); an absent list ⇒ no flag);
  * 3. spawn the worker; record worker_pid + worker_pid_start (CAS field
  *    merge); a rejected merge means a sibling owns the supervision — kill
  *    our worker and exit (zombie-tile guard);

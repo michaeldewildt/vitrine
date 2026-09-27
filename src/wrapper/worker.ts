@@ -29,12 +29,13 @@ export const VITRINE_CONTRACT = [
 
 /**
  * The worker argv (pi). `fromSessionFile` is the `--fork` source (a
- * `from`/`context` task); `agentBody` is the agent file's body. The `--tools`
- * flag is the worker's ceiling — pushed only when the agent declares a
- * NON-EMPTY tools list (the list, deduped, verbatim): an empty or absent
- * list means no `--tools` flag at all (the full default surface — the
- * v1.21 re-derivation: the old union with `vitrine_done` is gone with the
- * tool, so an empty list no longer needs to force a flag). `--session-dir`
+ * `from`/`context` task); `agentBody` is the agent file's body. `spec.agent.tools`
+ * encodes the worker's tool surface: a NON-EMPTY list ⇒ `--tools <list>`
+ * (the ceiling — the list, deduped, verbatim); the EMPTY list (a `noTools`
+ * agent, or a bare empty `tools:` frontmatter value) ⇒ `--no-tools` (zero
+ * tools — pi's dedicated flag; an empty `--tools` allowlist is not
+ * expressible); ABSENT ⇒ no flag at all (pi's default surface).
+ * `--session-dir`
  * is always passed so the worker's session file lands FLAT
  * in the known root, where the wrapper's discovery diffs. The
  * flag is NOT a no-op: without it pi uses its DEFAULT layout — a cwd-keyed
@@ -56,8 +57,11 @@ export function buildWorkerArgv(
 	args.push("--session-id", spec.session_id, "--name", spec.session_name, "--session-dir", sessionsRoot);
 	if (spec.agent.model !== undefined) args.push("--model", spec.agent.model);
 	if (spec.agent.thinking !== undefined) args.push("--thinking", spec.agent.thinking);
-	if (spec.agent.tools !== undefined && spec.agent.tools.length > 0) {
-		args.push("--tools", [...new Set(spec.agent.tools)].join(","));
+	if (spec.agent.tools !== undefined) {
+		// empty list ⇒ --no-tools (zero tools — the noTools / bare `tools:`
+		// encoding); non-empty ⇒ the --tools ceiling; absent ⇒ no flag.
+		if (spec.agent.tools.length > 0) args.push("--tools", [...new Set(spec.agent.tools)].join(","));
+		else args.push("--no-tools");
 	}
 	args.push("--append-system-prompt", systemPromptPath);
 	args.push("--", `@${join(dir, "prompt.md")}`);

@@ -22,6 +22,7 @@ import {
 	readSessionHeader,
 	totalCostUsd,
 	type LastEntryKind,
+	type SessionFacts,
 } from "../session";
 import {
 	buildHeadlessWorkerArgv,
@@ -81,6 +82,10 @@ export interface WorkerDeps {
 	procStartTime?: (pid: number) => string | undefined;
 	/** Is our stdout a TTY? Default `process.stdout.isTTY`. Tile: hard guard; headless: logged only. */
 	isTty?: () => boolean;
+	/** Fresh re-read of the kill file at settle time (default `P.killRequested`) — the settle's sub-tick re-check immediately before the marker write (the tick's `killRequested` fact can go stale within the tick). */
+	killRequestedNow?: (d: string) => Promise<boolean>;
+	/** The settle's session parse (default `parseSessionEntries`) — a seam for the settle-only re-parse (the tick's facts read always uses the real parse). */
+	parseSessionForSettle?: (path: string) => Promise<SessionFacts>;
 }
 
 /** The tile-mode wrapper deps (the audited tile lifecycle). */
@@ -192,6 +197,11 @@ async function runLifecycle(taskDir: string, deps: WorkerDeps, mode: Mode): Prom
 	const procAlive = deps.procAlive ?? ((pid: number) => P.pidInfo(pid).alive);
 	const procStartTime = deps.procStartTime ?? ((pid: number) => P.pidInfo(pid).startTime);
 	const spawnWorker = deps.spawnWorker ?? ((argv, env, opts) => spawnWorkerHandle(piBin, argv, env, opts));
+	// The settle's fresh reads (N1/N3 seams): the tick's facts can go stale
+	// within the tick — the settle re-reads the kill file and re-parses the
+	// session immediately before it acts.
+	const killRequestedNow = deps.killRequestedNow ?? ((d: string) => P.killRequested(d));
+	const parseSessionForSettle = deps.parseSessionForSettle ?? parseSessionEntries;
 
 	const spec = await P.readSpec(d);
 
@@ -404,12 +414,44 @@ async function runLifecycle(taskDir: string, deps: WorkerDeps, mode: Mode): Prom
 	// emit the settle event, settle `completed`, and leave for the
 	// keep-alive phase. `source` is the marker's (the settle's reason
 	// carries it); a marker that lands in the write gap (ordering rule 1)
-	// wins, and the settle takes ITS source.
-	const settleStopped = async (source: P.DoneMarker["source"], event: string): Promise<void> => {
-		const parsedSettle = sessionFile !== null ? await parseSessionEntries(sessionFile).catch(() => null) : null;
-		const harvested = parsedSettle !== null ? (lastAssistantText(parsedSettle.entries) ?? "(no assistant text harvested)") : "(no assistant text harvested)";
+	// wins, and the settle takes ITS source. Returns `"killed"` when the
+	// settle's fresh kill re-read (N1) finds a kill that landed in the
+	// sub-tick window — the settle then takes the existing kill path
+	// (never `completed (stop)`).
+	// The existing kill path (shared by the tick's `kill` case and the
+	// settle's fresh re-read — N1): kill the worker, partial harvest,
+	// settle `killed`.
+	const settleKilled = async (): Promise<"killed"> => {
+		await appendEvent({ event: "kill", source: signalIntent ?? "kill_requested", pid: wpid });
+		await killWorkerGraceful();
+		await partialHarvest(); // killed ⇒ partial harvest
+		await settle("killed", signalIntent !== null ? `signal-${signalIntent}` : "kill_requested", getExit());
+		titles?.set("killed", String(exitCodeOf(getExit()) ?? 0));
+		titles?.render();
+		return "killed";
+	};
+
+	const settleStopped = async (source: P.DoneMarker["source"], event: string): Promise<"completed" | "killed"> => {
+		const parsedSettle = sessionFile !== null ? await parseSessionForSettle(sessionFile).catch(() => null) : null;
+		// N3 — the harvest prefers result.md over the session, so a placeholder
+		// written on a transient re-parse failure would mask the worker's real
+		// final answer. Write result.md only when there is honest content to
+		// deliver: a parsed session (its last assistant text — the placeholder
+		// when the turn is genuinely empty) or no session at all (the session
+		// fallback cannot help either). A parse failure (session present but
+		// unreadable) skips the write: the harvest then falls back to the
+		// session text.
+		const harvested = parsedSettle === null ? null : (lastAssistantText(parsedSettle.entries) ?? "(no assistant text harvested)");
 		const rs = await stat(join(d, "result.md")).catch(() => null);
-		if (rs === null) await P.writeResult(d, harvested);
+		if (rs === null) {
+			if (harvested !== null) await P.writeResult(d, harvested);
+			else if (sessionFile === null) await P.writeResult(d, "(no assistant text harvested)");
+		}
+		// N1 — a fresh kill re-read immediately before the marker write
+		// (mirrors the auto-settle focus re-check): a kill file (or a signal)
+		// that landed between the tick's facts read and here settles `killed`
+		// via the existing kill path, never `completed (stop)`.
+		if ((await killRequestedNow(d).catch(() => false)) || signalIntent !== null) return await settleKilled();
 		let effective = source;
 		try {
 			await P.writeDoneMarker(d, source);
@@ -430,6 +472,7 @@ async function runLifecycle(taskDir: string, deps: WorkerDeps, mode: Mode): Prom
 		// the marker case.
 		kaSnapshot = lastGoodEntryCount;
 		enteredKeepAlive = true;
+		return "completed";
 	};
 
 	// Point 6 — the partial harvest: the session tail into
@@ -595,13 +638,7 @@ async function runLifecycle(taskDir: string, deps: WorkerDeps, mode: Mode): Prom
 					break;
 				}
 				case "kill": {
-					await appendEvent({ event: "kill", source: signalIntent ?? "kill_requested", pid: wpid });
-					await killWorkerGraceful();
-					await partialHarvest(); // killed ⇒ partial harvest
-					await settle("killed", signalIntent !== null ? `signal-${signalIntent}` : "kill_requested", getExit());
-					titles?.set("killed", String(exitCodeOf(getExit()) ?? 0));
-					titles?.render();
-					return "killed";
+					return await settleKilled();
 				}
 				case "timeout": {
 					await appendEvent({ event: "timeout", reason: action.reason });
@@ -620,7 +657,7 @@ async function runLifecycle(taskDir: string, deps: WorkerDeps, mode: Mode): Prom
 					// stop-settle here would race it; kept for the evaluator's
 					// contract, like auto-settle.
 					if (mode.kind === "headless") break;
-					await settleStopped("stop", "stop-settle");
+					if ((await settleStopped("stop", "stop-settle")) === "killed") return "killed";
 					break;
 				}
 				case "auto-settle": {
@@ -632,7 +669,7 @@ async function runLifecycle(taskDir: string, deps: WorkerDeps, mode: Mode): Prom
 					// a single poll interval.
 					const focusedNow = await mode.focusOnWorker();
 					if (focusedNow) break; // the user just showed up — skip this round
-					await settleStopped("auto_settle", "auto-settle");
+					if ((await settleStopped("auto_settle", "auto-settle")) === "killed") return "killed";
 					break;
 				}
 				case "wait":

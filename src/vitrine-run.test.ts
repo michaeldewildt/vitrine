@@ -62,6 +62,7 @@ import {
 	type WrapperDeps,
 	type WatchdogFacts,
 } from "./vitrine-run";
+import { harvestTask } from "./dispatch/harvest";
 
 const fixturePi = join(import.meta.dir, "..", "test", "fixtures", "fake-pi.ts");
 
@@ -275,6 +276,7 @@ const spec = (over: Partial<P.TaskSpec> = {}, agent: Partial<P.TaskSpec["agent"]
 			expect(args.at(-2)).toBe("--");
 			expect(args.at(-1)).toBe(`@${join(tasksRoot, "t", "prompt.md")}`);
 			expect(args).not.toContain("--tools");
+			expect(args).not.toContain("--no-tools");
 			expect(args).not.toContain("--model");
 			expect(args).not.toContain("--fork");
 			});
@@ -306,20 +308,18 @@ const spec = (over: Partial<P.TaskSpec> = {}, agent: Partial<P.TaskSpec["agent"]
 				expect(args[toi + 1])
 				.toBe("read,grep");
 			});
-			it("empty or absent tools list ⇒ no --tools flag at all (the full default surface)", () => {
-
-				// v1.21 re-derivation: the union with `vitrine_done` is gone, so an empty
-				// list no longer needs to force a flag — an empty list means no flag (the
-				// FULL default surface).
-				const args = buildWorkerArgv(join(tasksRoot, "t"), spec({}
-					, { tools: []
-				}),
-				null, "b", "/sessions");
+			it("empty tools list (the noTools encoding) ⇒ --no-tools (zero tools); absent list ⇒ no flag at all", () => {
+				// The noTools encoding: `noTools: true` (src/dispatch/core.ts) and a bare
+				// empty `tools:` frontmatter value both produce the EMPTY array — zero
+				// tools, pinned to pi's dedicated `--no-tools` flag (an empty `--tools`
+				// allowlist is not expressible; an empty flag would be the default
+				// surface, which is NOT zero tools).
+				const args = buildWorkerArgv(join(tasksRoot, "t"), spec({}, { tools: [] }), null, "b", "/sessions");
+				expect(args).toContain("--no-tools");
 				expect(args).not.toContain("--tools");
-				// and an absent list likewise (the `noTools` encoding)
-				const argsAbsent = buildWorkerArgv(join(tasksRoot, "t"), spec({}
-					, {}),
-				null, "b", "/sessions");
+				// an absent list ⇒ no flag at all (pi's default surface)
+				const argsAbsent = buildWorkerArgv(join(tasksRoot, "t"), spec({}, {}), null, "b", "/sessions");
+				expect(argsAbsent).not.toContain("--no-tools");
 				expect(argsAbsent).not.toContain("--tools");
 			});
 
@@ -785,7 +785,69 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 							expect((await P.readDoneMarker(dir))).toBeNull();
 							await P.requestKill(dir);
 							expect(await withTimeout(p, 15_000, "pending-tool settle guard")).toBe("killed");
-						});
+					});
+					it("a kill that lands in the settle's sub-tick window settles killed, not completed (stop)", async () => {
+						// The fixture cannot express the window (no sync point between the
+						// tick's facts read and the marker write), so the window is driven
+						// through the settle's fresh re-read seam: the tick's facts read the
+						// real kill file (absent), the watchdog says stop-settle, and the
+						// re-read (the seam) reports a kill that landed in between.
+						const dir = await makeTask({ auto_settle_s: 3600, auto_settle_grace_s: 60 });
+						const out = await withTimeout( runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "hang" }, { killRequestedNow: async () => true })),
+							15_000, "sub-tick kill", );
+						expect(out).toBe("killed");
+						const st = await P.readState(dir);
+						expect(st.state).toBe("killed");
+						expect(st.reason).toBe("kill_requested");
+						// the re-read beat the marker write: no done marker, no stop-settle
+						// event
+						expect(await P.readDoneMarker(dir)).toBeNull();
+						const ev = await eventsOf(dir);
+						expect(ev.some((e) => e.event === "kill")).toBe(true);
+						expect(ev.some((e) => e.event === "stop-settle")).toBe(false);
+						// the harvest had landed before the re-read (the write order)
+						expect(await readFile(join(dir, "result.md"), "utf8")).toContain("fixture finished the work");
+						// the kill path killed the worker
+						expect(st.worker_pid !== undefined && P.pidInfo(st.worker_pid).alive).toBe(false);
+					});
+					it("the stop-settle re-reads the kill file immediately before the marker write (the tick's fact is stale by then)", async () => {
+						// Structural pin: the seam is called only by the settle (the tick's
+						// facts read the real file) — the stop path performs a fresh re-read.
+						const dir = await makeTask({ auto_settle_s: 3600, auto_settle_grace_s: 60, completed_close_s: 1 });
+						let settleReads = 0;
+						const out = await withTimeout( runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "hang" }, { killRequestedNow: async () => (settleReads++, false) })),
+							15_000, "kill re-read", );
+						expect(out).toBe("completed");
+						expect((await P.readState(dir)).reason).toBe("stop");
+						expect(settleReads).toBeGreaterThanOrEqual(1);
+					});
+					it("a transient settle re-parse failure skips the result.md write (the harvest falls back to the session)", async () => {
+						const dir = await makeTask({ auto_settle_s: 3600, auto_settle_grace_s: 60, completed_close_s: 1 });
+						const out = await withTimeout( runWrapper( dir, depsFor({ VITRINE_FIXTURE_MODE: "hang" }
+							, { parseSessionForSettle: async () => {
+								throw new Error("simulated transient failure");
+							}, })),
+							15_000, "settle parse failure", );
+						expect(out).toBe("completed");
+						expect((await P.readState(dir)).reason).toBe("stop");
+						// no placeholder result.md: a parse failure must not mask the real
+						// answer
+						await expect(stat(join(dir, "result.md"))).rejects.toMatchObject({ code: "ENOENT" });
+						// the settle proceeded exactly as before (marker + completed)
+						expect((await P.readDoneMarker(dir))?.source).toBe("stop");
+						// and the harvest delivers the worker's actual final message (the
+						// session fallback)
+						const h = await harvestTask(dir, "completed");
+						expect(h.text).toContain("fixture finished the work");
+					});
+					it("a genuinely empty settled turn still writes the placeholder (the skip is the transient-failure case only)", async () => {
+						const dir = await makeTask({ auto_settle_s: 3600, auto_settle_grace_s: 60, completed_close_s: 1 });
+						const out = await withTimeout( runWrapper( dir, depsFor({ VITRINE_FIXTURE_MODE: "hang" }
+							, { parseSessionForSettle: async () => ({ entries: [{ type: "message", message: { role: "user" } }], skipped: 0 }) })),
+							15_000, "empty settle", );
+						expect(out).toBe("completed");
+						expect(await readFile(join(dir, "result.md"), "utf8")).toBe("(no assistant text harvested)");
+					});
 });
 
 						describe("keep-alive (v1.11)", () => {
