@@ -15,16 +15,14 @@
  * the task dir / the scratch cwd and decides — it never throws (unreadable
  * → fail with detail).
  *
- * Oracle kinds (the shipped battery uses the first three):
- *   data-match    — result.json `data.content` equals the expected string
- *                   (exact) — the typed-harvest contract
+ * Oracle kinds:
  *   file-content  — a scratch-cwd file byte-equals the expected content
  *   line-count    — a scratch-cwd file has exactly N lines
  *   result-text   — the task settled `completed` AND result.md (the harvest
  *                   text) contains the expected substring — the
  *                   fixture-compatible kind the hermetic driver tests use
- *                   (the fake-pi fixture ignores prompts, so the three real
- *                   kinds are not testable hermetically)
+ *                   (the fake-pi fixture ignores prompts, so the real kinds
+ *                   are not testable hermetically)
  */
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -40,7 +38,6 @@ export interface CwdFile {
 
 /** The oracle descriptor (the versioned content — the pure interpreter is `runOracle`). */
 export type OracleSpec =
-	| { kind: "data-match"; expected: string }
 	| { kind: "file-content"; file: string; expected: string }
 	| { kind: "line-count"; file: string; expected: number }
 	| { kind: "result-text"; contains: string };
@@ -58,8 +55,6 @@ export interface BatteryEntry {
 	agent: string;
 	/** The task text, verbatim (the brief the worker gets). */
 	task: string;
-	/** Optional — the typed-harvest contract (the worker's `vitrine_done` `data` must satisfy it). */
-	schema?: Record<string, unknown>;
 	/** The files the driver writes into the scratch cwd before dispatch. */
 	cwdFiles?: CwdFile[];
 	oracle: OracleSpec;
@@ -86,19 +81,6 @@ export async function runOracle(oracle: OracleSpec, taskDir: string, scratchCwd:
 	const fail = (detail: string): OracleVerdict => ({ pass: false, detail });
 	try {
 		switch (oracle.kind) {
-			case "data-match": {
-				const raw = await readFile(join(taskDir, "result.json"), "utf8").catch(() => null);
-				if (raw === null) return fail("data-match: result.json missing or unreadable");
-				let data: unknown;
-				try {
-					data = JSON.parse(raw);
-				} catch {
-					return fail("data-match: result.json is malformed JSON");
-				}
-				const content = typeof data === "object" && data !== null ? (data as Record<string, unknown>)["content"] : undefined;
-				if (typeof content !== "string") return fail("data-match: data.content missing or not a string");
-				return content === oracle.expected ? { pass: true, detail: "data-match: content matches exactly" } : fail(`data-match: content differs (${content.length} chars vs ${oracle.expected.length})`);
-			}
 			case "file-content": {
 				const raw = await readFile(join(scratchCwd, oracle.file), "utf8").catch(() => null);
 				if (raw === null) return fail(`file-content: ${oracle.file} missing or unreadable`);
@@ -140,7 +122,7 @@ export const READ_GROUND_CONTENT = [
 	"1. A task dir lives at ~/.vitrine/tasks/<uuid>/: the dir is 0700, its files 0600.",
 	"2. spec.json is the only parent→worker transport — written once, read-only afterwards.",
 	"3. state.json is monotonic: a state never moves backwards, terminal states never rewrite.",
-	"4. The worker signals completion with vitrine_done, which writes result.md and done.marker.",
+	"4. Completion is a fact the wrapper observes on its tick: the worker's final message is the deliverable, and the wrapper settles the task on the settled turn (or the headless process exit).",
 	"5. The wrapper is the watchdog: wall timeout, inactivity window, optional cost budget.",
 	"6. A foot tile when the compositor is reachable; a detached headless worker when it is not.",
 	"7. Every protocol fact is appended to events.jsonl — the append-only audit log.",
@@ -176,17 +158,12 @@ export const BATTERY: BatteryEntry[] = [
 		agent: "explore",
 		task: [
 			"Read the file facts.txt in your working directory.",
-			"Then finish with vitrine_done: in the `data` payload, set `content` to the file's exact content —",
-			"every line, byte for byte, with no additions, omissions, or rewording (the payload is the contract;",
-			"your prose answer can be a single line).",
+			"Then, in your final message, quote the file's exact content — every line, byte for byte,",
+			"with no additions, omissions, or rewording (the final message is the deliverable;",
+			"no trailing summary of it).",
 		].join(" "),
-		schema: {
-			type: "object",
-			properties: { content: { type: "string" } },
-			required: ["content"],
-		},
 		cwdFiles: [{ name: "facts.txt", content: READ_GROUND_CONTENT }],
-		oracle: { kind: "data-match", expected: READ_GROUND_CONTENT },
+		oracle: { kind: "result-text", contains: READ_GROUND_CONTENT },
 		timeout_s: 900,
 		inactivity_s: 600,
 	},
@@ -196,7 +173,7 @@ export const BATTERY: BatteryEntry[] = [
 		task: [
 			`Write a file named out.txt in your working directory containing exactly the following 10 lines — one per line, in this order, with a trailing newline after the last line:`,
 			BOUNDED_WRITE_LINES.join("\n"),
-			"Verify with: cat out.txt — every line must match the ten lines above exactly. Then finish with vitrine_done.",
+			"Verify with: cat out.txt — every line must match the ten lines above exactly. Then finish with a final message stating the verification result.",
 		].join("\n"),
 		oracle: { kind: "file-content", file: "out.txt", expected: BOUNDED_WRITE_CONTENT },
 		timeout_s: 900,
@@ -208,7 +185,7 @@ export const BATTERY: BatteryEntry[] = [
 		task: [
 			"Write a file named lines.txt in your working directory containing exactly 100 lines: the numbers",
 			"1 through 100, one number per line, in ascending order, with a trailing newline after the last line.",
-			"Verify with: wc -l lines.txt — the file must have exactly 100 lines. Then finish with vitrine_done.",
+			"Verify with: wc -l lines.txt — the file must have exactly 100 lines. Then finish with a final message stating the verification result.",
 		].join(" "),
 		oracle: { kind: "line-count", file: "lines.txt", expected: 100 },
 		timeout_s: 900,

@@ -14,11 +14,11 @@ import type { ExitCtx, WrapperOutcome } from "./lifecycle";
 /**
  * The headless exit mapping (branches pinned by test, in order):
  * 1. marker present ⇒ `completed` with the marker's source (rule 1 —
- *    including a worker that called `vitrine_done` under `--print` before
- *    exiting; a racing marker at the exit is caught here);
+ *    including a racing wrapper-written marker (stop/auto_settle) or a
+ *    historical `vitrine_done` marker on an old task at the exit);
  * 2. `kill_requested` / signal intent ⇒ `killed`;
  * 3. clean exit 0 + last session entry an idle-assistant ⇒ harvest
- *    (result.md ONLY IF ABSENT — a racing `vitrine_done` result wins) ⇒
+ *    (result.md ONLY IF ABSENT — a racing settle's result wins) ⇒
  *    `done.marker` (source `headless-exit`) ⇒ `completed`;
  * 4. clean exit 0 with no/other last entry ⇒ `crashed`/`headless-exit-
  *    empty-turn`, NO marker, partial harvest (a broken turn is never a
@@ -28,8 +28,9 @@ import type { ExitCtx, WrapperOutcome } from "./lifecycle";
  */
 export async function headlessWorkerExit(c: ExitCtx): Promise<WrapperOutcome> {
 	const exit = c.getExit()!;
-	// Re-check the marker at the exit: a racing `vitrine_done` can land
-	// between the tick's read and the exit (rule 1 wins).
+	// Re-check the marker at the exit: a racing wrapper-written marker (a
+	// sibling wrapper's stop-settle) can land between the tick's read and the
+	// exit (rule 1 wins).
 	const markerAtExit = await P.readDoneMarker(c.d).catch(() => null);
 	if (markerAtExit !== null) {
 		await c.appendEvent({ event: "worker-exit", code: exit.code, signal: exit.signal, error: exit.error });
@@ -54,8 +55,8 @@ export async function headlessWorkerExit(c: ExitCtx): Promise<WrapperOutcome> {
 		const idle = parsed !== null && lastMessageKind(parsed.entries) === "idle-assistant";
 		if (idle) {
 			const harvested = lastAssistantText(parsed!.entries) ?? "(no assistant text harvested)";
-			// result.md only if absent: a racing vitrine_done's result wins
-			// (it wrote it before its marker — which the marker re-check
+			// result.md only if absent: a racing settle's result wins (it
+			// wrote it before its marker — which the marker re-check
 			// above would have caught).
 			const rs = await stat(join(c.d, "result.md")).catch(() => null);
 			if (rs === null) await P.writeResult(c.d, harvested);

@@ -4,15 +4,18 @@
  * growth shaped like real entries, assistant/toolResult ordering per
  * session-format, tool hangs, clean/exotic exits) drives:
  * - wall / inactivity / cost watchdogs, the ×3 pending-toolCall window,
- * - the no-pending-toolCall idle condition (auto-settle settles only an
- * idle-assistant last entry; attended suppresses settle entirely),
- * - crash detection (exit code + signal), the SIGHUP trap, the
- * /proc/<foot_pid> backstop (window closed ⇒ killed),
- * - marker ⇒ completed (the keep-alive regime, v1.11: the completed tile
- * stays open — the unfocused-idle countdown closes it; a human-typed user
- * entry resumes it — one `resumed` event, the title flips to `continued`;
- * attended/0-`completed_close_s` tiles never auto-close), kill_requested ⇒
- * killed,
+ * - v1.21 stop-settle (completion on the tick: an unattended settled turn
+ *   settles `completed (stop)` — no quiet window, no focus gate; attended
+ *   suppresses it; a pending tool never settles),
+ * - crash detection (exit code + signal, mid-turn = non-idle last entry),
+ *   the SIGHUP trap, the /proc/<foot_pid> backstop (window closed ⇒ killed),
+ * - stop ⇒ completed (the keep-alive regime, v1.11: the completed tile
+ *   stays open — the unfocused-idle countdown closes it; a human-typed user
+ *   entry resumes it — one `resumed` event, the title flips to `continued`;
+ *   attended/0-`completed_close_s` tiles never auto-close), kill_requested ⇒
+ *   killed,
+ * - a tile worker that exits after a settled turn settles `stop` (the exit
+ *   mapping), not killed/crashed,
  * - stuck-queued handling (the wrapper never spawns a non-queued task)
  * and spawn-failed (state stays running, dead-wrapper reconcile settles
  * it to crashed),
@@ -30,7 +33,7 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { spawn } from "node:child_process";
-import { appendFile, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import * as P from "./protocol";
 import * as H from "../test/helpers";
@@ -275,7 +278,7 @@ const spec = (over: Partial<P.TaskSpec> = {}, agent: Partial<P.TaskSpec["agent"]
 			expect(args).not.toContain("--model");
 			expect(args).not.toContain("--fork");
 			});
-			it("full: model/thinking, the tools union with vitrine_done, and --fork first", () => {
+			it("full: model/thinking, the tools ceiling, and --fork first", () => {
 				const args = buildWorkerArgv( join(tasksRoot, "t"), spec({}
 					, { model: "ninfer/qwen3.8-27b", thinking: "high", tools: ["read", "grep"]
 				}),
@@ -288,32 +291,36 @@ const spec = (over: Partial<P.TaskSpec> = {}, agent: Partial<P.TaskSpec["agent"]
 				const ti = args.indexOf("--thinking");
 				expect(args[ti + 1])
 				.toBe("high");
+				// the tools ceiling: the agent's list, deduped, verbatim (no union —
+				// the `vitrine_done` union is gone with the tool)
 				const toi = args.indexOf("--tools");
 				expect(args[toi + 1])
-				.toBe("read,grep,vitrine_done");
+				.toBe("read,grep");
 			});
 			it("keeps an explicit tools list free of duplicates", () => {
 				const args = buildWorkerArgv(join(tasksRoot, "t"), spec({}
-					, { tools: ["vitrine_done", "read"]
+					, { tools: ["read", "read", "grep"]
 				}),
 				null, "b", "/sessions");
 				const toi = args.indexOf("--tools");
 				expect(args[toi + 1])
-				.toBe("vitrine_done,read");
+				.toBe("read,grep");
 			});
-			it("empty tools list ⇒ --tools vitrine_done (the ceiling, not the full surface)", () => {
+			it("empty or absent tools list ⇒ no --tools flag at all (the full default surface)", () => {
 
-			// tools: [] is an agent that allows nothing but its
-			// completion channel — no flag at all would run the worker with the
-			// FULL default surface (the ceiling would invert).
-			const args = buildWorkerArgv(join(tasksRoot, "t"), spec({}
-				, { tools: []
-			}),
-			null, "b", "/sessions");
-			const toi = args.indexOf("--tools");
-			expect(toi).toBeGreaterThan(-1);
-			expect(args[toi + 1])
-			.toBe("vitrine_done");
+				// v1.21 re-derivation: the union with `vitrine_done` is gone, so an empty
+				// list no longer needs to force a flag — an empty list means no flag (the
+				// FULL default surface).
+				const args = buildWorkerArgv(join(tasksRoot, "t"), spec({}
+					, { tools: []
+				}),
+				null, "b", "/sessions");
+				expect(args).not.toContain("--tools");
+				// and an absent list likewise (the `noTools` encoding)
+				const argsAbsent = buildWorkerArgv(join(tasksRoot, "t"), spec({}
+					, {}),
+				null, "b", "/sessions");
+				expect(argsAbsent).not.toContain("--tools");
 			});
 
 		});
@@ -342,9 +349,9 @@ const spec = (over: Partial<P.TaskSpec> = {}, agent: Partial<P.TaskSpec["agent"]
 					VITRINE_TASKS_ROOT: "/custom/tasks",
 					VITRINE_SESSIONS_DIR: "/custom/sessions",
 				});
-				// without these the worker would fall back to the defaults: `vitrine_done`
-				// would reject the task dir (bad-path) and the wrapper would never find
-				// the worker's session file (session.json discovery, watchdog inputs)
+				// without these the worker would fall back to the defaults and the
+				// wrapper would never find the worker's session file
+				// (session.json discovery, watchdog inputs)
 				expect(env.VITRINE_TASKS_ROOT).toBe("/custom/tasks");
 				expect(env.VITRINE_SESSIONS_DIR).toBe("/custom/sessions");
 			});
@@ -378,8 +385,8 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 });
 
 				it("marker beats everything (order rule 1)", () => {
-					expect(evaluateWatchdogs(facts({ markerPresent: true, markerSource: "vitrine_done" })))
-					.toEqual({ kind: "completed", source: "vitrine_done", });
+					expect(evaluateWatchdogs(facts({ markerPresent: true, markerSource: "stop" })))
+					.toEqual({ kind: "completed", source: "stop", });
 					expect( evaluateWatchdogs(facts({ markerPresent: true, markerSource: "auto_settle", killRequested: true, wallTimeoutS: 1 })),
 					).toEqual({ kind: "completed", source: "auto_settle" });
 				});
@@ -388,14 +395,18 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 					.toEqual({ kind: "kill" });
 				});
 				it("wall fires at the boundary", () => {
-					expect(evaluateWatchdogs(facts({ wallTimeoutS: 10, nowMs: 9_999 })))
+					// the pending-tool last entry isolates the wall (an idle-assistant
+					// would stop-settle first)
+					expect(evaluateWatchdogs(facts({ wallTimeoutS: 10, nowMs: 9_999, lastEntry: "pending-tool" })))
 					.toEqual({ kind: "wait" });
-					expect(evaluateWatchdogs(facts({ wallTimeoutS: 10, nowMs: 10_000 })))
+					expect(evaluateWatchdogs(facts({ wallTimeoutS: 10, nowMs: 10_000, lastEntry: "pending-tool" })))
 					.toEqual({ kind: "timeout", reason: "wall" });
 				});
 				it("inactivity: quiet ×1; ×3 while the last entry is a pending tool call", () => {
-					expect(evaluateWatchdogs(facts({ inactivityS: 1, sessionMtimeMs: 8_000 }))).toEqual({ kind: "timeout", reason: "inactivity" });
-					expect(evaluateWatchdogs(facts({ inactivityS: 1, sessionMtimeMs: 9_500 }))).toEqual({ kind: "wait" });
+					// attended isolates the ×1 quiet path (an unattended settled turn
+					// stop-settles first — inactivity is its last resort)
+					expect(evaluateWatchdogs(facts({ attended: true, inactivityS: 1, sessionMtimeMs: 8_000 }))).toEqual({ kind: "timeout", reason: "inactivity" });
+					expect(evaluateWatchdogs(facts({ attended: true, inactivityS: 1, sessionMtimeMs: 9_500 }))).toEqual({ kind: "wait" });
 					// pending tool: 2 s quiet is still inside the 3 s window
 					expect(evaluateWatchdogs(facts({ inactivityS: 1, sessionMtimeMs: 8_000, lastEntry: "pending-tool" }))).toEqual({
 						kind: "wait",
@@ -409,18 +420,23 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 				});
 
 				it("cost fires at the budget (local models report 0 — budgets bite on cloud)", () => {
-					expect(evaluateWatchdogs(facts({ maxCostUsd: 1, totalCostUsd: 0.99 }))).toEqual({ kind: "wait" });
-					expect(evaluateWatchdogs(facts({ maxCostUsd: 1, totalCostUsd: 1 }))).toEqual({ kind: "timeout", reason: "cost" });
+					// attended isolates the cost check (an unattended settled turn stop-settles first)
+					expect(evaluateWatchdogs(facts({ attended: true, maxCostUsd: 1, totalCostUsd: 0.99 }))).toEqual({ kind: "wait" });
+					expect(evaluateWatchdogs(facts({ attended: true, maxCostUsd: 1, totalCostUsd: 1 }))).toEqual({ kind: "timeout", reason: "cost" });
 				});
 
-				it("auto-settle: unattended + idle-assistant + quiet + unfocused; suppressed by attended/focus/idle-kind", () => {
+				it("stop-settle (v1.21): unattended + idle-assistant, immediate — no quiet window, no unfocused grace; suppressed by attended/busy-kind", () => {
 					const base2 = (over: Partial<WatchdogFacts> = {}): WatchdogFacts =>
 						facts({ autoSettleS: 1, autoSettleGraceS: 1, sessionMtimeMs: 8_000, unfocusedMs: 1_000, ...over });
-					expect(evaluateWatchdogs(base2())).toEqual({ kind: "auto-settle" });
+					// the old auto-settle facts (quiet + unfocused for the full windows) settle immediately now
+					expect(evaluateWatchdogs(base2())).toEqual({ kind: "stop-settle" });
 					expect(evaluateWatchdogs(base2({ attended: true }))).toEqual({ kind: "wait" });
 					expect(evaluateWatchdogs(base2({ lastEntry: "pending-tool" }))).toEqual({ kind: "wait" });
-					expect(evaluateWatchdogs(base2({ unfocusedMs: 999 }))).toEqual({ kind: "wait" });
-					expect(evaluateWatchdogs(base2({ sessionMtimeMs: 9_500 }))).toEqual({ kind: "wait" });
+					expect(evaluateWatchdogs(base2({ lastEntry: "other" }))).toEqual({ kind: "wait" });
+					// the quiet window and the unfocused grace no longer gate it —
+					// the keep-alive phase owns the viewing window after the settle
+					expect(evaluateWatchdogs(base2({ unfocusedMs: 0 }))).toEqual({ kind: "stop-settle" });
+					expect(evaluateWatchdogs(base2({ sessionMtimeMs: 9_999 }))).toEqual({ kind: "stop-settle" });
 				});
 });
 
@@ -559,28 +575,33 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 					});
 					// ---------------------------------------------------------------------------
 					// E2E — the wrapper drives the fixture pi
-					describe("completion (marker ⇒ completed)", () => {
-						it("vitrine_done from the worker: completed, result.md, session.json, SIGTERM of the (exited) worker", async () => {
-							const dir = await makeTask();
+					describe("stop (v1.21: completion on the tick)", () => {
+						it("stop-settle: the worker's turn settled (unattended) ⇒ completed (stop), result.md harvested, keep-alive closes it", async () => {
+							const dir = await makeTask({ completed_close_s: 1 });
 							const titles: string[]
 							= [];
-							const out = await withTimeout( runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "done" }
+							const out = await withTimeout( runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "hang" }
 							, { writeTitle: (t) => titles.push(t) })),
-							15_000, "done", );
+							15_000, "stop-settle", );
 							expect(out).toBe("completed");
 							const st = await P.readState(dir);
 							expect(st.state).toBe("completed");
-							expect(st.reason).toBe("vitrine_done");
-							expect(await readFile(join(dir, "result.md"), "utf8")).toBe("fixture result\n");
+							expect(st.reason).toBe("stop");
+							expect(await readFile(join(dir, "result.md"), "utf8")).toContain("fixture finished the work");
 							const marker = await P.readDoneMarker(dir);
-							expect(marker?.source).toBe("vitrine_done");
+							expect(marker?.source).toBe("stop");
 							const sess = await P.readSession(dir);
 							expect(await readSessionHeader(sess.session_file)).toEqual( expect.objectContaining({ id: `vitrine.${P.taskIdOf(dir)}` }),
 							);
 							const ev = await eventsOf(dir);
 							expect(ev.some((e) => e.event === "session")).toBe(true);
-							expect(ev.some((e) => e.event === "marker-observed" && e.source === "vitrine_done")).toBe(true);
+							expect(ev.some((e) => e.event === "stop-settle")).toBe(true);
+							expect(ev.some((e) => e.event === "done-marker" && e.source === "stop")).toBe(true);
+							expect(ev.some((e) => e.event === "completed-close")).toBe(true);
+							// the keep-alive close killed the resident worker
+							expect(st.worker_pid !== undefined && P.pidInfo(st.worker_pid).alive).toBe(false);
 							expect(titles.some((t) => t.includes("completed"))).toBe(true);
+							expect(titles.some((t) => t.includes("completed ("))).toBe(true); // the close countdown title
 
 					// the system prompt is a task-dir file (0600, wrapper-written before spawn)
 					const sp = await readFile(join(dir, "system-prompt.md"), "utf8");
@@ -589,44 +610,37 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 					const spStat = await stat(join(dir, "system-prompt.md"));
 					expect((spStat.mode & 0o777).toString(8)).toBe("600");
 					});
-					it("worker contract carries the small-model hardening (v1.20): completion act + audit manifest", () => {
+					it("worker contract carries the v1.21 completion doctrine: final message is the deliverable + audit manifest", () => {
 
-					// pinned as literals: a future contract rewrite must not silently drop these // lines (three-for-three nano run, 2026-09-19 — workers ended the turn on // the report and cited files they never opened).
-					expect(VITRINE_CONTRACT).toContain("Never stop after writing the final answer");
-					expect(VITRINE_CONTRACT).toContain("full report, not a summary");
+					// pinned as literals: a future contract rewrite must not silently drop these
+					// lines (the deliverable + the audit manifest).
+					expect(VITRINE_CONTRACT).toContain("Your final message is the deliverable");
 					expect(VITRINE_CONTRACT).toContain("OPENED FILES");
 					});
-					it("worker hangs after vitrine_done: the tile STAYS OPEN (keep-alive) and the countdown closes it", async () => {
+					it("a transient session read failure around the settle cannot misfire resumed (the snapshot is the last GOOD count, never 0)", async () => {
 						const dir = await makeTask({ completed_close_s: 1 });
 						const titles: string[]
 						= [];
-						const out = await withTimeout( runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "done-hang" }
-						, { writeTitle: (t) => titles.push(t) })),
-						15_000, "done-hang keep-alive", );
-						expect(out).toBe("completed");
-						const st = await P.readState(dir);
-						expect(st.state).toBe("completed");
-						expect(st.worker_pid !== undefined && P.pidInfo(st.worker_pid).alive).toBe(false);
-						const ev = await eventsOf(dir);
-						expect(ev.some((e) => e.event === "completed-close")).toBe(true);
-						expect(titles.some((t) => t.includes("completed ("))).toBe(true);
-
-					// the close countdown title
-					});
-					it("a transient session read failure at the entry tick cannot misfire resumed (the snapshot is the last GOOD count, never 0)", async () => {
-						const dir = await makeTask({ completed_close_s: 1 });
-						const titles: string[]
-						= [];
-						const out = await withTimeout( runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "done-snapshot-hollow" }
-						, { writeTitle: (t) => titles.push(t) })),
-						20_000, "snapshot-hollow", );
+						const p = runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "hang" }
+						, { writeTitle: (t) => titles.push(t) }));
+						// wait for the session attach (session.json written by the wrapper)
+						await withTimeout( (async () => {
+							while ((await P.readSession(dir).catch(() => null)) === null) await msleep(20);
+						})
+						(), 10_000, "session attach", );
+						const { session_file } = await P.readSession(dir);
+						// a transient read failure: hide the session file for a few ticks
+						await rename(session_file, session_file + ".hidden");
+						await msleep(500);
+						await rename(session_file + ".hidden", session_file);
+						const out = await withTimeout(p, 20_000, "snapshot-hollow");
 						expect(out).toBe("completed");
 						const st = await P.readState(dir);
 						expect(st.state).toBe("completed");
 						const ev = await eventsOf(dir);
 						expect(ev.some((e) => e.event === "resumed")).toBe(false);
 
-					// the initial prompt is not a resume (pre-fix: the snapshot was 0 and it fired)
+					// the initial prompt is not a resume (the snapshot is the last GOOD count, never 0)
 					expect(ev.some((e) => e.event === "completed-close")).toBe(true);
 
 					// the session was restored → the countdown still closes
@@ -634,13 +648,20 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 					expect(titles.some((t) => t.includes("continued"))).toBe(false);
 					});
 					it("worker exits after completion: the wrapper closes the tile with it (event pinned, no settle)", async () => {
-						const dir = await makeTask();
-						const out = await withTimeout(runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "done" })),
-						15_000, "self-exit");
-						expect(out).toBe("completed");
+						const dir = await makeTask({ completed_close_s: 3600 });
+						const p = runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "hang" }));
+						await withTimeout( (async () => {
+							while ((await P.readState(dir)).state !== "completed") await msleep(50);
+						})
+						(), 10_000, "wait for completed", );
 						const st = await P.readState(dir);
-						expect(st.state).toBe("completed");
-						expect(st.reason).toBe("vitrine_done"); // the original settle's reason — untouched
+						expect(st.reason).toBe("stop"); // the original settle's reason — untouched
+						expect(st.worker_pid !== undefined && P.pidInfo(st.worker_pid).alive).toBe(true);
+						// the resident worker self-exits after completion
+						process.kill(st.worker_pid!, "SIGKILL");
+						const out = await withTimeout(p, 15_000, "self-exit");
+						expect(out).toBe("completed");
+						expect((await P.readState(dir)).state).toBe("completed");
 						const ev = await eventsOf(dir);
 						expect(ev.some((e) => e.event === "worker-exit-after-completion")).toBe(true);
 						expect(ev.some((e) => e.event === "transition-rejected")).toBe(false);
@@ -649,10 +670,12 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 
 				describe("watchdogs (fixture-driven)", () => {
 					it("wall timeout kills the worker and records timeout (wall)", async () => {
+						// pending-tool: the turn never settles, so the wall — not
+						// the stop-settle — is what ends it
 						const dir = await makeTask({ wall_timeout_s: 1 });
 						const titles: string[]
 						= [];
-						const out = await withTimeout( runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "hang" }
+						const out = await withTimeout( runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "pending-tool" }
 						, { writeTitle: (t) => titles.push(t) })),
 						15_000, "wall", );
 						expect(out).toBe("timeout");
@@ -665,7 +688,9 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 						expect(ev.some((e) => e.event === "timeout" && e.reason === "wall")).toBe(true);
 					});
 					it("inactivity fires after the quiet window (no pending tool)", async () => {
-						const dir = await makeTask({ inactivity_s: 1 });
+						// attended: the settled turn never stop-settles (the human's
+						// workspace), so the inactivity quiet window is what fires
+						const dir = await makeTask({ inactivity_s: 1, attended: true });
 						const out = await withTimeout( runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "slow", VITRINE_FIXTURE_GAP_MS: "1500" })),
 						15_000, "inactivity", );
 						expect(out).toBe("timeout");
@@ -684,9 +709,12 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 					});
 
 					it("cost budget expiry", async () => {
+						// pending-tool: the turn never settles, so the cost budget —
+						// not the stop-settle — is what ends it (the single toolCall
+						// entry's cost reaches the budget at the first tick)
 						const dir = await makeTask({ max_cost_usd: 0.8 });
 						const out = await withTimeout(
-							runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "slow", VITRINE_FIXTURE_GAP_MS: "200", VITRINE_FIXTURE_COST: "0.5" })),
+							runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "pending-tool", VITRINE_FIXTURE_COST: "0.8" })),
 							15_000,
 							"cost",
 						);
@@ -696,44 +724,49 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 					});
 });
 
-					describe("auto-settle (focus-gated, unattended only)", () => {
-						it("settles an idle-unfocused tile: harvests the last text, marker auto_settle, keep-alive closes it", async () => {
-							const dir = await makeTask({ auto_settle_s: 1, auto_settle_grace_s: 2, completed_close_s: 1 });
+					describe("stop-settle (v1.21: completion on the tick, unattended only)", () => {
+						it("settles a stopped tile on the tick (no quiet window, no unfocused grace): marker stop, harvested result, keep-alive closes it", async () => {
+							// auto_settle_s far in the future: if this settled, it was the
+							// stop-settle (the immediate channel), not the auto-settle
+							const dir = await makeTask({ auto_settle_s: 3600, auto_settle_grace_s: 60, completed_close_s: 1 });
 							const titles: string[]
 							= [];
 							const out = await withTimeout( runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "hang" }
 							, { writeTitle: (t) => titles.push(t) })),
-							15_000, "auto-settle", );
+							15_000, "stop-settle", );
 							expect(out).toBe("completed");
 							const st = await P.readState(dir);
 							expect(st.state).toBe("completed");
-							expect(st.reason).toBe("auto_settle");
-							expect(await P.readDoneMarker(dir)).toEqual(expect.objectContaining({ source: "auto_settle" }));
+							expect(st.reason).toBe("stop");
+							expect(await P.readDoneMarker(dir)).toEqual(expect.objectContaining({ source: "stop" }));
 							expect(await readFile(join(dir, "result.md"), "utf8")).toContain("fixture finished the work");
 							expect(st.worker_pid !== undefined && P.pidInfo(st.worker_pid).alive).toBe(false);
-							expect(titles.some((t) => t.includes("idle ("))).toBe(true);
 							const ev = await eventsOf(dir);
-							expect(ev.some((e) => e.event === "auto-settle")).toBe(true);
+							expect(ev.some((e) => e.event === "stop-settle")).toBe(true);
 							expect(ev.some((e) => e.event === "completed-close")).toBe(true);
 							// the keep-alive close
 							});
-							it("a focused tile is never settled (the human is watching)", async () => {
+							it("a focused tile is settled too (the keep-alive phase owns the viewing window)", async () => {
 								let focused = true;
-								const dir = await makeTask({ auto_settle_s: 1, auto_settle_grace_s: 1, completed_close_s: 1 });
+								const dir = await makeTask({ completed_close_s: 1 });
 								const p = runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "hang" }
 								, { focusOnWorker: async () => focused }));
 								await msleep(2_000);
 
-							// past settle+grace — but focused the whole time
-							expect((await P.readState(dir)).state).toBe("running");
+							// settled — focus no longer gates the settle (v1.21) — but the
+							// human is watching, so the tile STAYS OPEN (keep-alive)
+							const st = await P.readState(dir);
+							expect(st.state).toBe("completed");
+							expect(st.reason).toBe("stop");
+							expect(st.worker_pid !== undefined && P.pidInfo(st.worker_pid).alive).toBe(true);
 							focused = false;
 
-							// the human looks away
-							const out = await withTimeout(p, 15_000, "settle after focus drops");
+							// the human looks away — the countdown closes
+							const out = await withTimeout(p, 15_000, "close after focus drops");
 							expect(out).toBe("completed");
-							expect((await P.readState(dir)).reason).toBe("auto_settle");
+							expect((await P.readState(dir)).reason).toBe("stop");
 							});
-							it("attended: settle is suppressed entirely (only vitrine_done or a close completes it)", async () => {
+							it("attended: settle is suppressed entirely (the human's workspace: only a kill or a close completes it)", async () => {
 								const dir = await makeTask({ attended: true, auto_settle_s: 1, auto_settle_grace_s: 1 });
 								const p = runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "hang" }));
 								await msleep(2_500);
@@ -767,7 +800,7 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 							it("focused completed tile: the countdown never fires (the human is reading)", async () => {
 								let focused = true;
 								const dir = await makeTask({ completed_close_s: 1 });
-								const p = runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "done-hang" }
+								const p = runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "hang" }
 								, { focusOnWorker: async () => focused }));
 								await msleep(1_500);
 								// well past the window — but focused the whole time
@@ -784,24 +817,24 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 								expect((await P.readState(dir)).state).toBe("completed");
 								expect(st.worker_pid !== undefined && P.pidInfo(st.worker_pid).alive).toBe(false);
 								});
-								it("attended: a completed tile never auto-closes (SIGHUP closes it, no settle)", async () => {
+								it("attended: the completion channel is suppressed — the tile never settles, never auto-closes (a signal closes it as killed)", async () => {
 									const dir = await makeTask({ attended: true, completed_close_s: 1 });
 									process.on("SIGHUP", sighupGuard);
 									try {
-										const p = runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "done-hang" }));
+										const p = runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "hang" }));
 										await msleep(1_500);
 
 								const st = await P.readState(dir);
-								expect(st.state).toBe("completed");
+								expect(st.state).toBe("running"); // never settled (attended suppresses stop-settle)
 								expect(st.worker_pid !== undefined && P.pidInfo(st.worker_pid).alive).toBe(true);
 
 								// never auto-closes
 								process.kill(process.pid, "SIGHUP");
-								const out = await withTimeout(p, 15_000, "attended keep-alive SIGHUP");
-								expect(out).toBe("completed");
-								expect((await P.readState(dir)).state).toBe("completed");
+								const out = await withTimeout(p, 15_000, "attended stop-settle SIGHUP");
+								expect(out).toBe("killed");
+								expect((await P.readState(dir)).state).toBe("killed"); // it was never settled
 
-								// no settle — already terminal
+								// the close killed the worker
 								expect(st.worker_pid !== undefined && P.pidInfo(st.worker_pid).alive).toBe(false);
 								}
 									finally { process.removeListener("SIGHUP", sighupGuard);
@@ -809,7 +842,7 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 								});
 								it("completed_close_s: 0: a completed tile never auto-closes", async () => {
 									const dir = await makeTask({ completed_close_s: 0 });
-									const p = runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "done-hang" }));
+									const p = runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "hang" }));
 									await msleep(1_500);
 
 								// well past where a 1 s window would have closed
@@ -832,7 +865,7 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 									const dir = await makeTask({ completed_close_s: 3600 });
 									const titles: string[]
 									= [];
-									const p = runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "done-hang" }
+									const p = runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "hang" }
 									, { writeTitle: (t) => titles.push(t) }));
 									await waitCompleted(dir);
 									const before = await P.readState(dir);
@@ -874,8 +907,11 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 								});
 								it("a busy resumed turn (pending tool call) is never killed by the countdown", async () => {
 									const dir = await makeTask({ completed_close_s: 1 });
-									const p = runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "done-busy-resume" }));
+									const p = runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "hang" }));
 									await waitCompleted(dir);
+									// the worker resumes a turn: a pending toolCall as the last entry
+									const sess = await P.readSession(dir);
+									await appendFile(sess.session_file, `${JSON.stringify({ id: `busy-${Date.now()}`, parentId: null, timestamp: new Date().toISOString(), type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "call_busy_resume", name: "bash", arguments: { command: "long-running" } }], stopReason: "toolUse" }, })}\n`);
 									await msleep(1_500);
 
 								// well past the window — but the last entry is a pending tool call
@@ -895,7 +931,7 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 									const rawFile = join(sessionsRoot, "raw-ka-source.jsonl");
 									await writeFile( rawFile, `${JSON.stringify({ type: "session", version: 3, id: "ka-src", timestamp: new Date().toISOString(), cwd: cwdA })}\n${JSON.stringify({ type: "message", message: { role: "user", content: "source user entry" } })}\n`, );
 									const dir = await makeTask({ cwd: cwdA, from_session_file: rawFile, completed_close_s: 3600 });
-									const p = runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "done-hang" }));
+									const p = runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "hang" }));
 									await waitCompleted(dir);
 									await msleep(1_000);
 
@@ -915,7 +951,7 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 
 							});
 							describe("crash & window-close paths", () => {
-								it("worker crash (exit 3): crashed + stderr tail + session-tail partial harvest", async () => {
+								it("worker crash (exit 3, mid-turn): crashed + stderr tail + session-tail partial harvest", async () => {
 									const dir = await makeTask();
 									const out = await withTimeout(runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "crash" })),
 									15_000, "crash");
@@ -927,7 +963,9 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 									const tail = await readFile(join(dir, "tail.log"), "utf8");
 									expect(tail).toContain("fixture: about to crash");
 									expect(tail).toContain("--- session tail ---");
-									expect(tail).toContain("partial work");
+									// the turn broke mid-tool (a pending toolCall last) — the
+									// partial harvest has no assistant text
+									expect(tail).toContain("(no assistant text)");
 								});
 								it("worker killed by a signal (SIGKILL): crashed, exit_code 137", async () => {
 									const dir = await makeTask();
@@ -945,7 +983,9 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 									// keep the test process alive if the signal lands pre-handler
 									process.on("SIGHUP", guard);
 									try {
-										const p = runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "hang" }));
+										const p = runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "pending-tool" }));
+										// pending-tool: the turn never settles, so the SIGHUP —
+										// not the stop-settle — is what ends it
 										await msleep(300);
 										process.kill(process.pid, "SIGHUP");
 										const out = await withTimeout(p, 15_000, "SIGHUP");
@@ -961,7 +1001,7 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 										const dir = await makeTask();
 										const foot = spawn("bun", ["-e", "setTimeout(() => {}, 400)"])
 										;
-										const out = await withTimeout(runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "hang" }
+										const out = await withTimeout(runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "pending-tool" }
 										, { footPid: foot.pid! })),
 										15_000, "ppid backstop");
 										foot.kill("SIGKILL");
@@ -974,7 +1014,7 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 									});
 									it("kill_requested file: the wrapper kills the worker and records killed", async () => {
 										const dir = await makeTask();
-										const p = runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "hang" }));
+										const p = runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "pending-tool" }));
 										await msleep(300);
 										await P.requestKill(dir);
 										const out = await withTimeout(p, 15_000, "kill_requested");
@@ -984,10 +1024,11 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 										expect(st.worker_pid !== undefined && P.pidInfo(st.worker_pid).alive).toBe(false);
 										const ev = await eventsOf(dir);
 										expect(ev.some((e) => e.event === "kill")).toBe(true);
-										// killed ⇒ partial harvest (the session tail in tail.log)
+										// killed ⇒ partial harvest (the session tail in tail.log) — the
+										// turn never produced text (a pending tool call last)
 										const tail = await readFile(join(dir, "tail.log"), "utf8");
 										expect(tail).toContain("--- session tail ---");
-										expect(tail).toContain("fixture finished the work");
+										expect(tail).toContain("(no assistant text)");
 								});
 });
 
@@ -1044,9 +1085,10 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 											runWrapper(dirB, depsFor({ VITRINE_FIXTURE_MODE: "clean" })),
 											])
 											, 15_000, "concurrent discovery", );
-											// clean exits with no marker: the worker dying with code 0 is a close
-											expect(outA).toBe("killed");
-											expect(outB).toBe("killed");
+											// clean: a settled turn + exit 0 — the wrapper observes the STOP
+											// (the exit mapping settles `stop`, not killed)
+											expect(outA).toBe("completed");
+											expect(outB).toBe("completed");
 											const sA = await P.readSession(dirA);
 											const sB = await P.readSession(dirB);
 											expect(await readSessionHeader(sA.session_file)).toEqual( expect.objectContaining({ id: `vitrine.${P.taskIdOf(dirA)}`, cwd: cwdA }),
@@ -1063,7 +1105,7 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 											// creates A's file in cwdB's session dir
 											const outB = await withTimeout(runWrapper(dirB, depsFor({ VITRINE_FIXTURE_MODE: "clean" })),
 											15_000, "no misadoption");
-											expect(outB).toBe("killed");
+											expect(outB).toBe("completed"); // the stop on exit
 											const sB = await P.readSession(dirB);
 											expect((await readSessionHeader(sB.session_file))?.id).toBe(`vitrine.${P.taskIdOf(dirB)}`);
 											});
@@ -1073,9 +1115,9 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 											const dir = await makeTask({ cwd: cwdA });
 											const out = await withTimeout( runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "clean", VITRINE_FIXTURE_IGNORE_SESSION_ID: "1" })),
 											15_000, "pass-2 discovery", );
-											expect(out).toBe("killed");
+											expect(out).toBe("completed"); // the stop on exit
 
-											// clean exit, no marker
+											// clean exit after a settled turn
 											const s = await P.readSession(dir);
 											const hdr = await readSessionHeader(s.session_file);
 											expect(hdr).not.toBeNull();
@@ -1090,11 +1132,11 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 											// discovery. This test pins latest-wins: the worker's own (latest)
 											// name must match, not the source's.
 											const fromDir = await makeTask({ cwd: cwdA });
-											await withTimeout(runWrapper(fromDir, depsFor({ VITRINE_FIXTURE_MODE: "done" })),
+											await withTimeout(runWrapper(fromDir, depsFor({ VITRINE_FIXTURE_MODE: "clean" })),
 											15_000, "from task (latest-wins)");
 											expect((await P.readState(fromDir)).state).toBe("completed");
 											const toDir = await makeTask({ cwd: cwdA, from_task_id: P.taskIdOf(fromDir) });
-											const out = await withTimeout( runWrapper(toDir, depsFor({ VITRINE_FIXTURE_MODE: "done", VITRINE_FIXTURE_IGNORE_SESSION_ID: "1" })),
+											const out = await withTimeout( runWrapper(toDir, depsFor({ VITRINE_FIXTURE_MODE: "clean", VITRINE_FIXTURE_IGNORE_SESSION_ID: "1" })),
 											15_000, "fork + name discovery", );
 											expect(out).toBe("completed");
 											const s = await P.readSession(toDir);
@@ -1109,7 +1151,9 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 										describe("zombie-tile guard", () => {
 											it("a sibling-settled task: the wrapper kills its own worker before exiting", async () => {
 												const dir = await makeTask();
-												const p = runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "hang" }));
+												const p = runWrapper(dir, depsFor({ VITRINE_FIXTURE_MODE: "pending-tool" }));
+												// pending-tool: the turn never settles (a settled turn would
+												// stop-settle before the 600 ms mark), so at 600 ms the task is still running
 												await msleep(600);
 												// the worker is alive and its pid is recorded
 												const mid = await P.readState(dir);
@@ -1139,7 +1183,7 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 													> = async (argv, env, opts) => {
 														argvBox.v = argv;
 														return spawnWorkerHandle("bun", [fixturePi, ...argv]
-														, { ...env, VITRINE_FIXTURE_MODE: "done", VITRINE_SESSIONS_DIR: sessionsRoot }
+														, { ...env, VITRINE_FIXTURE_MODE: "clean", VITRINE_SESSIONS_DIR: sessionsRoot }
 														, opts);
 													};
 													const out = await withTimeout(runWrapper(dir, depsFor({}
@@ -1156,7 +1200,7 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 												});
 												it("forks the source session: --fork argv, parentSession header, fresh discovery", async () => {
 													const fromDir = await makeTask({ cwd: cwdA });
-													await withTimeout(runWrapper(fromDir, depsFor({ VITRINE_FIXTURE_MODE: "done" })),
+													await withTimeout(runWrapper(fromDir, depsFor({ VITRINE_FIXTURE_MODE: "clean" })),
 													15_000, "from task");
 													expect((await P.readState(fromDir)).state).toBe("completed");
 													const fromSession = await P.readSession(fromDir);
@@ -1168,7 +1212,7 @@ const facts = (over: Partial<WatchdogFacts> = {}): WatchdogFacts => ({
 													> = async (argv, env, opts) => {
 														argvBox.v = argv;
 														return spawnWorkerHandle("bun", [fixturePi, ...argv]
-														, { ...env, VITRINE_FIXTURE_MODE: "done", VITRINE_SESSIONS_DIR: sessionsRoot }
+														, { ...env, VITRINE_FIXTURE_MODE: "clean", VITRINE_SESSIONS_DIR: sessionsRoot }
 														, opts);
 													};
 													const out = await withTimeout( runWrapper(toDir, depsFor({}
@@ -1258,16 +1302,20 @@ describe("headless exit mapping", () => {
 		expect(await P.readDoneMarker(dir)).toBeNull();
 	});
 
-	it("a vitrine_done marker wins over the exit mapping (source preserved)", async () => {
+	it("a pre-existing marker wins over the exit mapping (source preserved, rule 1)", async () => {
 		const dir = await headlessTask();
-		const out = await withTimeout(runHeadlessWrapper(dir, headlessDeps({ VITRINE_FIXTURE_MODE: "done" })), 15_000, "headless done");
+		// a racing/sibling marker (or a historical `vitrine_done` one on an
+		// old task): the marker's source is the settle's reason
+		await P.writeDoneMarker(dir, "stop");
+		const out = await withTimeout(runHeadlessWrapper(dir, headlessDeps({ VITRINE_FIXTURE_MODE: "clean" })), 15_000, "headless marker-wins");
 		expect(out).toBe("completed");
 		const st = await P.readState(dir);
 		expect(st.state).toBe("completed");
+		expect(st.reason).toBe("stop");
 		const marker = await P.readDoneMarker(dir);
-		expect(marker?.source).toBe("vitrine_done");
-		const result = await readFile(join(dir, "result.md"), "utf8").catch(() => null);
-		expect(result ?? "").toContain("fixture");
+		expect(marker?.source).toBe("stop");
+		const ev = await eventsOf(dir);
+		expect(ev.some((e) => e.event === "marker-observed" && e.source === "stop")).toBe(true);
 	});
 });
 
@@ -1312,7 +1360,7 @@ describe("mode asymmetry (seven-point contract pins)", () => {
 
 	it("Point 3: the hand-off records wrapper_pid_start in both modes and foot_pid tile-only", async () => {
 		const tDir = await makeTask({ mode: "tile", cwd: cwdA });
-		await withTimeout(runWrapper(tDir, depsFor({ VITRINE_FIXTURE_MODE: "done" })), 15_000, "tile hand-off fields");
+		await withTimeout(runWrapper(tDir, depsFor({ VITRINE_FIXTURE_MODE: "clean" })), 15_000, "tile hand-off fields");
 		const tst = await P.readState(tDir);
 		expect(tst.wrapper_pid).toBeTypeOf("number");
 		expect(tst.wrapper_pid_start).toBeTypeOf("string");

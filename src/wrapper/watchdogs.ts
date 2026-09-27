@@ -31,15 +31,19 @@ export type WatchdogAction =
 	| { kind: "completed"; source: DoneMarker["source"] }
 	| { kind: "kill" }
 	| { kind: "timeout"; reason: "wall" | "inactivity" | "cost" }
+	| { kind: "stop-settle" }
 	| { kind: "auto-settle" }
 	| { kind: "wait" };
 
 /**
  * The watchdog decision for one tick. Precedence (rule 1 first):
- * marker ⇒ completed; kill intent ⇒ kill; then wall, inactivity (×3 while the
- * last entry is a pending tool call), cost; then auto-settle (unattended,
- * idle — last entry an assistant with no pending tool calls — quiet for
- * `auto_settle_s`, and the tile unfocused for `auto_settle_grace_s`).
+ * marker ⇒ completed; kill intent ⇒ kill; then wall, cost; then stop-settle
+ * (unattended, and the last entry a settled turn — idle-assistant: the
+ * worker STOPPED. No quiet window, no unfocused grace — the keep-alive
+ * phase owns the viewing window after the settle); then inactivity (×3
+ * while the last entry is a pending tool call) and auto-settle (the
+ * last resorts — e.g. inactivity for a pending-tool turn that never
+ * settles).
  * The final focus re-check happens in the caller, immediately before the
  * auto-settle `done.marker` write.
  */
@@ -47,11 +51,16 @@ export function evaluateWatchdogs(f: WatchdogFacts): WatchdogAction {
 	if (f.markerPresent) return { kind: "completed", source: f.markerSource ?? "vitrine_done" };
 	if (f.killRequested) return { kind: "kill" };
 	if (f.nowMs - f.wallStartMs >= f.wallTimeoutS * 1000) return { kind: "timeout", reason: "wall" };
+	if (f.maxCostUsd !== null && f.totalCostUsd >= f.maxCostUsd) return { kind: "timeout", reason: "cost" };
+	// v1.21 — stop-settle: completion is a fact the wrapper observes on its
+	// tick — the worker's turn settled (the last entry is an idle-assistant),
+	// and no human is holding the tile (attended suppresses). The wrapper
+	// observes "stopped" (mechanical), never "complete" (semantic).
+	if (!f.attended && f.lastEntry === "idle-assistant") return { kind: "stop-settle" };
 	if (f.sessionMtimeMs !== null) {
 		const factor = f.lastEntry === "pending-tool" ? 3 : 1;
 		if (f.nowMs - f.sessionMtimeMs >= f.inactivityS * 1000 * factor) return { kind: "timeout", reason: "inactivity" };
 	}
-	if (f.maxCostUsd !== null && f.totalCostUsd >= f.maxCostUsd) return { kind: "timeout", reason: "cost" };
 	if (
 		!f.attended &&
 		f.lastEntry === "idle-assistant" &&

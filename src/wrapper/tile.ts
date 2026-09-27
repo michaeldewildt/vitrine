@@ -6,9 +6,12 @@
  * completed tile stays open in its own regime: no watchdogs, no settle).
  */
 import { hyprctlRun } from "../hyprctl";
+import { stat } from "node:fs/promises";
+import { join } from "node:path";
 import * as P from "../protocol";
 import {
 	hasUserEntryBeyond,
+	lastAssistantText,
 	lastMessageKind,
 	parseSessionEntries,
 	type LastEntryKind,
@@ -122,13 +125,48 @@ export function focusOnWorkerCheck(footPid: number): () => Promise<boolean> {
 // worker exit (the child-exit event, not polling)
 
 /**
- * The tile-mode worker-exit mapping: kill intent (signal / kill_requested)
- * or a clean exit 0 ⇒ `killed`; anything else ⇒ `crashed`. The headless
- * mapping is the 5-branch pinned version (wrapper/headless.ts).
+ * The tile-mode worker-exit mapping: v1.21 — a worker that died after a
+ * settled turn (the last session entry an idle-assistant, no kill intent)
+ * STOPPED, it did not crash: settle `stop` via the same path as the
+ * stop-settle watchdog (harvest + the `stop` marker + `completed`), as
+ * headless already does for its exit. Then the old mapping: kill intent
+ * (signal / kill_requested) or a clean exit 0 ⇒ `killed`; anything else
+ * (a non-idle last entry) ⇒ `crashed`. The headless mapping is the
+ * 5-branch pinned version (wrapper/headless.ts).
  */
 export async function tileWorkerExit(c: ExitCtx): Promise<WrapperOutcome> {
 	const exit = c.getExit()!;
 	const wasKilled = (await P.killRequested(c.d).catch(() => false)) || c.signalIntent() !== null;
+	// The terminal stop on exit (v1.21): the turn settled before the worker
+	// died — the wrapper observes "stopped", never "crashed". A killed
+	// worker keeps the killed mapping (it was killed).
+	if (!wasKilled) {
+		const sFile = c.sessionFile();
+		const parsed = sFile !== null ? await parseSessionEntries(sFile).catch(() => null) : null;
+		if (parsed !== null && lastMessageKind(parsed.entries) === "idle-assistant") {
+			const harvested = lastAssistantText(parsed.entries) ?? "(no assistant text harvested)";
+			// result.md only if absent: a racing settle's result wins (it
+			// wrote it before its marker — which the settle's catch would
+			// have caught).
+			const rs = await stat(join(c.d, "result.md")).catch(() => null);
+			if (rs === null) await P.writeResult(c.d, harvested);
+			let source: P.DoneMarker["source"] = "stop";
+			try {
+				await P.writeDoneMarker(c.d, "stop");
+				await c.appendEvent({ event: "stop-settle", source: "stop", via: "worker-exit" });
+			} catch (e) {
+				// A racing marker landed in the write gap — ordering rule 1:
+				// its marker wins; settle with its source.
+				if (!(e instanceof P.ProtocolError && e.code === "marker-exists")) throw e;
+				const existing = await P.readDoneMarker(c.d);
+				source = existing?.source ?? "stop";
+				await c.appendEvent({ event: "marker-observed", source });
+			}
+			await c.appendEvent({ event: "worker-exit", code: exit.code, signal: exit.signal, error: exit.error });
+			await c.settle("completed", source, exit);
+			return "completed";
+		}
+	}
 	const to: "killed" | "crashed" = wasKilled || exit.code === 0 ? "killed" : "crashed";
 	const reason = wasKilled
 		? c.signalIntent() !== null

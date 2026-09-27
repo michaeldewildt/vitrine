@@ -143,7 +143,6 @@ export async function runLive(opts: LiveOptions = {}, out: (l: string) => void =
 								cwd: scratch,
 								timeout: entry.timeout_s ?? DEFAULT_TIMEOUT_S,
 								inactivity: entry.inactivity_s ?? DEFAULT_INACTIVITY_S,
-								...(entry.schema !== undefined ? { output_schema: entry.schema } : {}),
 							},
 						],
 						mode,

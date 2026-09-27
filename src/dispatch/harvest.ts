@@ -103,7 +103,7 @@ export interface Harvest {
 	overflowFile?: string;
 	/** True when the task dir vanished mid-call (a concurrent `vitrine gc`). */
 	gone: boolean;
-	/** The typed data (the parsed `result.json` — the worker's `vitrine_done` `data`) — machine-readable, uncapped. */
+	/** The typed data (the parsed `result.json` — the worker's typed payload, historical: written by the retired `vitrine_done` tool on pre-v1.21 task dirs) — machine-readable, uncapped. */
 	data?: unknown;
 	/** The data for the report (compact JSON, capped; the capped text names its overflow file). */
 	dataText?: string;
@@ -137,7 +137,7 @@ export async function harvestTask(
 			}
 			throw e;
 		}
-		// 1. result.md (the worker's final answer — vitrine_done).
+		// 1. result.md (the worker's final answer — harvested by the wrapper's stop-settle).
 		let text: string | null = null;
 		let source = "result.md";
 		const resultRaw = await readFile(join(d, "result.md"), "utf8").catch((e: NodeJS.ErrnoException) => (e.code === "ENOENT" ? null : Promise.reject(e)));
@@ -164,8 +164,9 @@ export async function harvestTask(
 			text === null
 				? { text: `(no harvestable content — ${source} absent)`, partial, gone: false }
 				: capText(text, { maxBytes, maxLines, tmpDir, id: P.taskIdOf(d), partial, source });
-		// The typed data (`result.json` — `vitrine_done`'s `data`, written after
-		// the prose answer): harvested alongside it, orthogonal to the text chain.
+		// The typed data (`result.json` — the worker's typed payload, written after
+		// the prose answer by the retired `vitrine_done` tool on pre-v1.21 task dirs):
+		// harvested alongside it, orthogonal to the text chain.
 		const dataRaw = await readFile(join(d, "result.json"), "utf8").catch((e: NodeJS.ErrnoException) => (e.code === "ENOENT" ? null : Promise.reject(e)));
 		if (dataRaw === null) return base;
 		let parsed: unknown;

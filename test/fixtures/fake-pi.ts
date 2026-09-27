@@ -7,26 +7,20 @@
  * Mimics the observable behaviour of real pi: parses the same argv
  * (buildWorkerArgv's output), writes a session file in the pi format
  * (header + session_info + message entries, append-only) under the
- * cwd-keyed session dir, and honours `VITRINE_TASK_DIR` for the
- * vitrine_done simulation.
+ * cwd-keyed session dir.
  *
  * Scenario env (set by the tests):
  *   VITRINE_FIXTURE_MODE:
  *     clean         — canned turn (toolCall → toolResult → final text), exit 0
- *     done          — clean turn, then writes result.md + done.marker, exit 0
- *     done-hang     — same, then hangs (the keep-alive regime keeps the tile
- *                     open; the unfocused-idle countdown closes it, v1.11)
- *     done-snapshot-hollow — clean turn + done.marker, with the session file
- *                     renamed away around the marker write (a transient read
- *                     failure at the keep-alive entry tick — the resume
- *                     snapshot must not scan from the initial prompt, audit
- *                     B1), then restored; hangs (the countdown closes it)
- *     done-busy-resume — clean turn + done.marker, then a pending toolCall
- *                     (a busy resumed turn), then hang (the keep-alive idle
- *                     gate must not kill it, v1.11)
- *     hang          — one settled turn, then hangs (idle-assistant forever)
- *     crash         — stderr line, one entry, exit 3
- *     crash-sig     — one entry, then SIGKILLs itself
+ *                     (the headless completion channel: settled turn, the
+ *                     process exit settles it via the headless-exit marker)
+ *     hang          — one settled turn, then hangs (idle-assistant forever —
+ *                     the tile completion channel: the wrapper's stop-settle
+ *                     settles it; the keep-alive countdown closes it)
+ *     crash         — a mid-turn break: a pending toolCall as the LAST entry,
+ *                     stderr line, exit 3 (a settled-then-died turn is a STOP,
+ *                     not a crash — the crash mapping is the non-idle case)
+ *     crash-sig     — same mid-turn break, then SIGKILLs itself
  *     exit0-broken  — a pending toolCall (no result) as the LAST entry, exit 0
  *                     (the headless content gate: broken turn, clean exit)
  *     slow          — entry, long gap, entry (the inactivity window fires mid-gap)
@@ -36,7 +30,7 @@
  *   VITRINE_FIXTURE_COST    — usage.cost.total per assistant entry (default 0)
  *   VITRINE_FIXTURE_IGNORE_SESSION_ID=1 — random session id (name-based discovery)
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -173,58 +167,25 @@ const finishClean = async (): Promise<void> => {
 	await sleep(gapMs);
 };
 
-const vitrineDone = (): void => {
-	const taskDir = process.env.VITRINE_TASK_DIR;
-	if (taskDir === undefined) {
-		process.stderr.write("fixture: VITRINE_TASK_DIR missing — cannot vitrine_done\n");
-		return;
-	}
-	writeFileSync(join(taskDir, "result.md"), "fixture result\n");
-	writeFileSync(join(taskDir, "done.marker"), JSON.stringify({ ts: iso(), source: "vitrine_done" }) + "\n");
-	appendFileSync(join(taskDir, "events.jsonl"), JSON.stringify({ ts: iso(), event: "vitrine_done" }) + "\n");
-};
-
 switch (mode) {
 	case "clean":
 		await finishClean();
 		process.exit(0);
-		break;
-	case "done":
-		await finishClean();
-		vitrineDone();
-		process.exit(0);
-		break;
-	case "done-hang":
-		await finishClean();
-		vitrineDone();
-		await new Promise(() => {}); // hang — the keep-alive countdown closes us (v1.11)
-		break;
-	case "done-snapshot-hollow":
-		await finishClean();
-		await sleep(400); // wrapper ticks: session attached + parsed (last good count)
-		renameSync(file, file + ".hidden"); // the entry tick: the session is unreadable (transient)
-		vitrineDone();
-		await sleep(300); // the wrapper's entry tick lands while the file is hidden
-		renameSync(file + ".hidden", file);
-		await new Promise(() => {}); // hang — the countdown closes us (v1.11)
-		break;
-	case "done-busy-resume":
-		await finishClean();
-		vitrineDone();
-		asst([{ type: "toolCall", id: "call_busy_resume", name: "bash", arguments: { command: "long-running" } }], "toolUse");
-		await new Promise(() => {}); // a busy resumed turn: pending toolCall, no result
 		break;
 	case "hang":
 		asst([{ type: "text", text: "fixture finished the work" }], "stop");
 		await new Promise(() => {});
 		break;
 	case "crash":
+		// a mid-turn break (the last entry is a PENDING toolCall — non-idle):
+		// a settled-then-died turn is a STOP (the wrapper settles `stop`), so
+		// the crash mapping is pinned on the non-idle last entry
 		process.stderr.write("fixture: about to crash\n");
-		asst([{ type: "text", text: "partial work" }], "stop");
+		asst([{ type: "toolCall", id: "call_crash", name: "bash", arguments: { command: "will-crash" } }], "toolUse");
 		process.exit(3);
 		break;
 	case "crash-sig":
-		asst([{ type: "text", text: "partial work" }], "stop");
+		asst([{ type: "toolCall", id: "call_crash_sig", name: "bash", arguments: { command: "will-crash" } }], "toolUse");
 		process.kill(process.pid, "SIGKILL");
 		break;
 	case "exit0-broken":

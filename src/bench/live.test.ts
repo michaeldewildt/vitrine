@@ -33,7 +33,7 @@ const TEST_BATTERY: BatteryEntry[] = [
 		id: "bench-live",
 		agent: "bench-live",
 		task: "do the bench thing",
-		oracle: { kind: "result-text", contains: "fixture result" },
+		oracle: { kind: "result-text", contains: "fixture finished the work" },
 		timeout_s: 120,
 		inactivity_s: 60,
 	},
@@ -55,7 +55,7 @@ beforeAll(async () => {
 	// the driver's pi shim (the wrapper's buildWorkerEnv does not forward
 	// VITRINE_FIXTURE_* — the fixture env is baked into the shim's env)
 	const shim = join(base, "pi-shim");
-	await writeFile(shim, `#!/bin/sh\nexport VITRINE_FIXTURE_MODE=done\nexport VITRINE_FIXTURE_GAP_MS=30\nexec ${process.execPath} ${FIXTURE_PI} "$@"\n`);
+	await writeFile(shim, `#!/bin/sh\nexport VITRINE_FIXTURE_MODE=clean\nexport VITRINE_FIXTURE_GAP_MS=30\nexec ${process.execPath} ${FIXTURE_PI} "$@"\n`);
 	await chmod(shim, 0o755);
 	process.env.VITRINE_PI_BIN = shim;
 });

@@ -1,66 +1,34 @@
 /**
- * vitrine.ts — the Vitrine pi extension.
+ * vitrine.ts — the Vitrine pi extension (dispatcher-only, v1.21).
  *
- * One package, two roles, switched by env ("The worker-mode extension"):
- * - dispatcher sessions: registers the `vitrine_dispatch` tool — admit, spawn,
- *   return (the async contract: the tool path never waits; the harvest is
- *   reported on settlement as a delivery, and the queue is owned by the
- *   session's watcher from the pass onward). The mode is the protocol's
- *   decision, not a second probe: the compositor reachability probe
- *   (tool-side only) picks the spawn shape — tile if reachable, headless
- *   otherwise, never the reverse.
- * - worker mode (`VITRINE_TASK_DIR` in env): registers exactly one tool,
- *   `vitrine_done(answer, data?)` — writes `result.md` (+ `result.json` when
- *   `data` is present) + `done.marker` and one `events.jsonl` line; never
- *   `state.json` (single-writer rule). When the task's spec declares an
- *   `output_schema`, `data` is required and is validated against it at the
- *   call (fail-fast — the worker sees the field errors and retries).
- *   No dispatch tool in worker mode.
+ * Registers the `vitrine_dispatch` tool — admit, spawn, return (the async
+ * contract: the tool path never waits; the harvest is reported on settlement
+ * as a delivery, and the queue is owned by the session's watcher from the
+ * pass onward). The mode is the protocol's decision, not a second probe: the
+ * compositor reachability probe (tool-side only) picks the spawn shape — tile
+ * if reachable, headless otherwise, never the reverse.
+ *
+ * Workers see no extension tools: v1.21 retired the `vitrine_done` worker
+ * tool — completion is a fact the wrapper observes on its tick (the
+ * stop-settle: the worker's turn settled, unattended; headless: the process
+ * exit), and the worker's final message is the deliverable. `VITRINE_TASK_DIR`
+ * in env no longer switches an extension mode.
  *
  * Cutover rule: one name, one owner — refuse rather than shadow;
  * the ownership check runs at `session_start` (see below).
  */
-import { appendFileSync, realpathSync, statSync } from "node:fs";
+import { realpathSync } from "node:fs";
 import { open } from "node:fs/promises";
-import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { getMarkdownTheme, type ExtensionAPI, type ExtensionToolContext, type ToolResult } from "@earendil-works/pi-coding-agent";
-import { Container, Markdown, Text } from "@earendil-works/pi-tui";
+import { type ExtensionAPI, type ExtensionToolContext, type ToolResult } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { Compile } from "typebox/compile";
-import * as P from "./protocol";
 import * as D from "./dispatch";
 import { collectTasks } from "./collect";
 import { startSessionWatcher, type DeliveryOptions, type HarvestMessage, type SessionWatcher } from "./watcher";
 import { listAgentSummaries } from "./agents";
-import { makeDoneRenderers, type DoneRenderDeps } from "./done-render";
 
 const DISPATCH_TOOL = "vitrine_dispatch";
 const COLLECT_TOOL = "vitrine_collect";
-const DONE_TOOL = "vitrine_done";
-
-/**
- * The `vitrine_done` TUI renderers (v1.14) — the worker's own
- * tile shows the recorded answer as markdown (the completed tile is kept
- * open so the human can read it; the default rendering would
- * bury the answer in the escaped-JSON tool argument). Worker mode only —
- * the dispatcher's panel never sees them (master-side result UX untouched).
- * The pure logic + stub-driven tests live in
- * src/done-render.ts; the pi-tui packages resolve only under pi's
- * extension loader (headless `--print` loads these imports but never calls
- * the renderers).
- */
-const doneRenderDeps: DoneRenderDeps = {
-	text: (content, padX, padY) => new Text(content, padX, padY),
-	container: (children) => {
-		const c = new Container();
-		for (const child of children) c.addChild(child);
-		return c;
-	},
-	markdown: (text, padX, padY, theme) => new Markdown(text, padX, padY, theme),
-	markdownTheme: () => getMarkdownTheme(),
-};
-const doneRenderers = makeDoneRenderers(doneRenderDeps);
 
 /** The `vitrine_dispatch` mechanics — the stable opening
  * paragraph of the tool description, VERBATIM; the roster + policy lines
@@ -136,136 +104,7 @@ function modelString(model: unknown): string | null {
 	return null;
 }
 
-function isTaskDir(dir: string): boolean {
-	// A real task dir: a directory, a bare uuid basename, a spec.json the
-	// wrapper (via the protocol) wrote before the worker loaded — and
-	// lexically inside the tasks root (a uuid-named dir elsewhere is not
-	// ours even if it happens to carry a spec.json). A uuid-named dir with no
-	// spec.json is not a task (an empty leftover) and is refused.
-	try {
-		const st = statSync(dir);
-		if (!st.isDirectory()) return false;
-		const root = P.tasksRoot();
-		if (!dir.startsWith(root + "/")) return false;
-		if (!P.UUID_RE.test(dir.split("/").pop() ?? "")) return false;
-		return statSync(join(dir, "spec.json")).isFile();
-	} catch {
-		return false;
-	}
-}
-
-function refuseWorkerMode(taskDir: string, why: string): void {
-	// The wrapper appends the worker's stderr to tail.log; a direct tail.log
-	// line keeps the record even if the wrapper never ran.
-	const line = JSON.stringify({ ts: new Date().toISOString(), event: "worker-mode-refused", reason: why, source: "extension" }) + "\n";
-	try {
-		appendFileSync(join(taskDir, "tail.log"), line);
-	} catch {
-		// best-effort — the stderr line still reaches tail.log via the wrapper
-	}
-	process.stderr.write(`vitrine: refusing worker mode — ${why} (VITRINE_TASK_DIR=${taskDir}); the task will settle via its watchdogs\n`);
-}
-
 export default function vitrine(pi: ExtensionAPI): void {
-	const taskDir = process.env.VITRINE_TASK_DIR;
-
-	// ---- worker mode ----------------------------------------------------------
-	if (taskDir !== undefined) {
-		if (!isTaskDir(taskDir)) {
-			refuseWorkerMode(taskDir, "VITRINE_TASK_DIR is not a valid task dir");
-			return;
-		}
-		pi.registerTool({
-			name: DONE_TOOL,
-			label: "Vitrine done",
-			description:
-				"Finish this vitrine task. Call it exactly once, when the task is complete, with the final answer " +
-				"(the text the dispatcher should read). It records the answer and signals the wrapper; after the " +
-				"call returns, stop immediately.",
-			parameters: Type.Object({
-				answer: Type.String({ description: "The final answer — written to result.md, model-facing on harvest." }),
-				data: Type.Optional(
-					Type.Unknown({
-						description:
-							"Optional typed data payload (arbitrary JSON) — written to result.json alongside the answer. " +
-							"REQUIRED when this task's dispatch declared an output_schema: the payload must satisfy that " +
-							"schema, otherwise this call errors (naming the offending fields) so you retry with a fixed payload.",
-					}),
-				),
-			}),
-			// Custom TUI rendering (v1.14): the answer is shown as
-			// markdown in the worker's own tile. Never called in headless mode.
-			renderCall: doneRenderers.renderCall,
-			renderResult: doneRenderers.renderResult,
-			async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResult> {
-				const answer = typeof params.answer === "string" ? params.answer : "";
-				const data = params.data; // Type.Optional(Type.Unknown()) — present iff the model passed it
-				// Failure: let it throw — no try/catch. pi wraps a thrown error into
-				// an error tool result (isError: true): the worker sees the message
-				// and continues, and the wrapper's watchdogs remain the safety net.
-				// AgentToolResult carries no isError field, so throwing is the
-				// contract-faithful error path (a string result is a success to pi).
-				const d = await P.assertTaskDir(taskDir);
-				// The resume commit (R12): a second `vitrine_done` on an already-
-				// terminal task is an idempotent no-op — the done marker is
-				// write-once, so the handler short-circuits: NO event, no state
-				// change, no re-recording. (A confused worker repeating the call
-				// gets a plain acknowledgement, not an error — and a human-resumed
-				// session keeps talking after settlement without re-settling.)
-				const existingMarker = await P.readDoneMarker(d);
-				if (existingMarker !== null) {
-					return {
-						content: [{ type: "text", text: `Already settled: the answer was recorded on an earlier vitrine_done (marker source: ${existingMarker.source}) — this call is a no-op (no event, no state change). Stop immediately.` }],
-						details: { noop: true, source: existingMarker.source },
-					};
-				}
-				// The typed-harvest contract: when the dispatch declared an
-				// `output_schema`, `data` is REQUIRED and must satisfy the schema
-				// — validated at the call (fail-fast) so the worker retries with a
-				// fixed payload. The prose answer (result.md) and the typed data
-				// (result.json) stay orthogonal.
-				const spec = await P.readSpec(d);
-				if (spec.output_schema !== undefined) {
-					if (data === undefined) {
-						throw new Error(
-							"this task declares an output_schema — vitrine_done requires the `data` parameter (the contract was declared; the payload is missing)",
-						);
-					}
-					let validator;
-					try {
-						validator = Compile(spec.output_schema);
-					} catch (e: unknown) {
-						// the contract was declared and is unverifiable — fail closed
-						throw new Error(`the task's output_schema failed to compile — failing closed: ${e instanceof Error ? e.message : String(e)}`);
-					}
-					if (!validator.Check(data)) {
-						const detail = validator
-							.Errors(data)
-							.slice(0, 5)
-							.map((er) => `${er.instancePath === "" ? "(root)" : er.instancePath} ${er.message}`)
-							.join("; ");
-						throw new Error(`data does not satisfy the task's output_schema — ${detail}; fix the payload and call vitrine_done again`);
-					}
-				}
-				await P.writeResult(d, answer);
-				if (data !== undefined) await P.writeResultJson(d, data); // no schema + data present: still recorded (harmless)
-				await P.writeDoneMarker(d, "vitrine_done");
-				await P.appendEvent(d, { event: "vitrine_done", source: "worker", ...(data !== undefined ? { data: true } : {}) });
-				// A plain-string result crashes pi's TUI (getTextOutput dereferences
-				// `result.content`) and is silently dropped from the session record —
-				// the result must be a ToolResult object (pi 0.85.1, verified 2026-09-17).
-				// `details.answer` rides the session record so the TUI renderer above
-				// shows the exact recorded text — and re-shows it on re-render/resume
-				// (the keep-alive tile). The model-facing ack is unchanged.
-				return {
-					content: [{ type: "text", text: "Done. The answer is recorded; the wrapper will settle the task. Stop immediately." }],
-					details: data === undefined ? { answer } : { answer, dataRecorded: true },
-				};
-			},
-		});
-		return;
-	}
-
 	// ---- dispatcher mode ------------------------------------------------------
 	// The description is composed ONCE here, at load — not per tool call: the
 	// roster comes from the resolver's own layer so it cannot drift, and new
@@ -303,14 +142,6 @@ export default function vitrine(pi: ExtensionAPI): void {
 					timeout: Type.Optional(Type.Number({ description: "Wall-clock budget in seconds. Default: config wall_timeout_s." })),
 					inactivity: Type.Optional(Type.Number({ description: "Watchdog idle budget in seconds. Default: agent frontmatter → config inactivity_s." })),
 					max_cost_usd: Type.Optional(Type.Number({ description: "Max total session cost in USD; the cost watchdog settles the task at the budget (reason 'cost'). No default — unset means no cost budget." })),
-					output_schema: Type.Optional(
-						Type.Object({}, {
-							description:
-								"Optional typed-harvest contract — a JSON Schema the worker's vitrine_done `data` payload must satisfy. " +
-								"When declared, the payload is required and validated at the call; the data is recorded to result.json and " +
-								"rendered (capped) in the harvest report.",
-						}),
-					),
 				}),
 				{ minItems: 1, maxItems: 8, description: "1–8 tasks per invocation; overflow queues within the call." },
 			),

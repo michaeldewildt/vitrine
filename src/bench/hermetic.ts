@@ -14,7 +14,8 @@
  * Fixture env gap (settled): the real wrapper's `buildWorkerEnv`
  * (`src/wrapper/worker.ts`) does NOT forward `VITRINE_FIXTURE_*` — so the
  * driver writes its OWN pi shim (an executable `#!/bin/sh` script, the
- * dispatch.test.ts pattern) with `VITRINE_FIXTURE_MODE=done`,
+ * dispatch.test.ts pattern) with `VITRINE_FIXTURE_MODE=clean` (the
+ * headless completion channel: settled turn + the process exit),
  * `VITRINE_FIXTURE_GAP_MS` and `VITRINE_FIXTURE_COST` baked into the
  * shim's env, and points `VITRINE_PI_BIN` at it.
  *
@@ -154,7 +155,7 @@ export async function runHermetic(opts: HermeticOptions = {}, out: (l: string) =
 		// VITRINE_FIXTURE_*, so the fixture env is baked into the shim's env.
 		await writeFile(
 			shim,
-			`#!/bin/sh\nexport VITRINE_FIXTURE_MODE=done\nexport VITRINE_FIXTURE_GAP_MS=${gapMs}\nexport VITRINE_FIXTURE_COST=${cost}\nexec ${BUN_PATH} ${FIXTURE_PI} "$@"\n`,
+			`#!/bin/sh\nexport VITRINE_FIXTURE_MODE=clean\nexport VITRINE_FIXTURE_GAP_MS=${gapMs}\nexport VITRINE_FIXTURE_COST=${cost}\nexec ${BUN_PATH} ${FIXTURE_PI} "$@"\n`,
 		);
 		await chmod(shim, 0o755);
 		process.env.VITRINE_PI_BIN = shim;

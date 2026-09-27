@@ -118,14 +118,14 @@ const eventsJsonl = (): string =>
 		{ ts: iso(1000), event: "transition", from: "queued", to: "running", reason: "spawn" },
 		{ ts: iso(1005), event: "spawn", mode: "headless", wrapper_pid: 1 },
 		{ ts: iso(1500), event: "session", session_id: "vitrine.x" },
-		{ ts: iso(5000), event: "done-marker", source: "vitrine_done" },
-		{ ts: iso(5900), event: "marker-observed", source: "vitrine_done" },
-		{ ts: iso(5950), event: "transition", from: "running", to: "completed", reason: "worker" },
+		{ ts: iso(5000), event: "done-marker", source: "stop" },
+		{ ts: iso(5900), event: "marker-observed", source: "stop" },
+		{ ts: iso(5950), event: "transition", from: "running", to: "completed", reason: "stop" },
 	]
 		.map((l) => JSON.stringify(l))
 		.join("\n") + "\n";
 
-const stateJson = (): string => JSON.stringify({ state: "completed", started_at: iso(1000), finished_at: iso(5950), reason: "worker" }, null, 2) + "\n";
+const stateJson = (): string => JSON.stringify({ state: "completed", started_at: iso(1000), finished_at: iso(5950), reason: "stop" }, null, 2) + "\n";
 
 const sessionJson = (file: string): string => JSON.stringify({ session_id: "vitrine.x", session_file: file }, null, 2) + "\n";
 
@@ -146,7 +146,7 @@ describe("collector: a complete modern dir", () => {
 		expect(row.thinking).toBe("high");
 		expect(row.mode).toBe("headless");
 		expect(row.state).toBe("completed");
-		expect(row.reason).toBe("worker");
+		expect(row.reason).toBe("stop");
 		expect(row.queue_ms).toBe(1000);
 		expect(row.boot_ms).toBe(500);
 		expect(row.work_ms).toBe(3500);
@@ -172,7 +172,7 @@ describe("collector: a complete modern dir", () => {
 		// finished_at 120 ms after the terminal transition
 		const dir = await writeDir({
 			"spec.json": specJson(),
-			"state.json": JSON.stringify({ state: "completed", finished_at: iso(6070), reason: "worker" }, null, 2) + "\n",
+			"state.json": JSON.stringify({ state: "completed", finished_at: iso(6070), reason: "stop" }, null, 2) + "\n",
 			"session.json": sessionJson(sess),
 			"events.jsonl": eventsJsonl(),
 		});
@@ -187,7 +187,7 @@ describe("collector: a complete modern dir", () => {
 		await writeFile(sess, sessionFile());
 		const dir = await writeDir({
 			"spec.json": specJson(),
-			"state.json": JSON.stringify({ state: "completed", finished_at: iso(5960), reason: "worker" }, null, 2) + "\n",
+			"state.json": JSON.stringify({ state: "completed", finished_at: iso(5960), reason: "stop" }, null, 2) + "\n",
 			"session.json": sessionJson(sess),
 			"events.jsonl": eventsJsonl(),
 		});
@@ -283,7 +283,7 @@ describe("collector: medians + the report", () => {
 		const mk = async (off: number): Promise<string> =>
 			writeDir({
 				"spec.json": specJson(),
-				"state.json": JSON.stringify({ state: "completed", finished_at: iso(5950 + off), reason: "worker" }, null, 2) + "\n",
+				"state.json": JSON.stringify({ state: "completed", finished_at: iso(5950 + off), reason: "stop" }, null, 2) + "\n",
 				"session.json": sessionJson(sess),
 				"events.jsonl": eventsJsonl(),
 			});
@@ -304,7 +304,8 @@ describe("collector: medians + the report", () => {
 });
 
 describe("collector: the headless content-gate path (done-marker, no marker-observed)", () => {
-	// headless.ts branch 3: clean exit 0, idle assistant, no vitrine_done →
+	// headless.ts branch 3: clean exit 0, idle assistant (the turn settled; no
+	// marker yet — the wrapper writes it at the exit) →
 	// done-marker (source headless-exit) → worker-exit → terminal transition.
 	// NO marker-observed event — the worker-exit event stands in for the
 	// observation point (poll = done-marker → worker-exit, settle =

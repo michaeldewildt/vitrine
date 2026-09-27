@@ -6,7 +6,8 @@
  * `~/.vitrine/tasks/<uuid>/`: `spec.json` (written once, dispatch-tool-owned,
  * read-only afterwards), `prompt.md`, `state.json` (the status record),
  * `session.json` (wrapper-owned, written once after spawn), `result.md` +
- * `done.marker` (`vitrine_done`), `events.jsonl` (append-only audit),
+ * `done.marker` (stop / auto-settle / headless-exit), `events.jsonl`
+ * (append-only audit),
  * `kill_requested` (presence-only), `tail.log`.
  *
  * This module enforces mechanically: path containment (`<tasksRoot>/<uuid>/`,

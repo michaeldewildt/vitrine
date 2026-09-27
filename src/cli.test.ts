@@ -182,7 +182,7 @@ describe("kill", () => {
 		const dir = await newTask();
 		const id = P.taskIdOf(dir);
 		await P.transitionState(dir, "queued", "running", {});
-		await P.writeDoneMarker(dir, "vitrine_done");
+		await P.writeDoneMarker(dir, "stop");
 		await P.transitionState(dir, "running", "completed"); // marker-wins path
 		const r = await runCli(["kill", id], QUIET);
 		expect(r.code).toBe(0);
@@ -476,7 +476,7 @@ describe("bench live (the flag surface + the CLI→driver chain against the fixt
 			"---\nname: execute\ndescription: fixture bounded implementer for the bench live CLI test.\nmodel: ninfer/bench-model\n---\n# Execute\n\nFixture.\n",
 		);
 		shim = join(base, "pi-shim");
-		await writeFile(shim, `#!/bin/sh\nexport VITRINE_FIXTURE_MODE=done\nexport VITRINE_FIXTURE_GAP_MS=30\nexec ${process.execPath} ${REPO_ROOT}/test/fixtures/fake-pi.ts "$@"\n`);
+		await writeFile(shim, `#!/bin/sh\nexport VITRINE_FIXTURE_MODE=clean\nexport VITRINE_FIXTURE_GAP_MS=30\nexec ${process.execPath} ${REPO_ROOT}/test/fixtures/fake-pi.ts "$@"\n`);
 		await chmod(shim, 0o755);
 		realPiBin = process.env.VITRINE_PI_BIN;
 		process.env.VITRINE_PI_BIN = shim;

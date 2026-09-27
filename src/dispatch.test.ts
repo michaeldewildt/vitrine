@@ -220,48 +220,6 @@ describe("surface validation", () => {
 		await rejectsDispatch("bad-input", () => dispatchTasks({ tasks: [{ agent: "test-agent", task: "t", max_cost_usd: -1 }], mode: "tile", dispatcher: info(), bunBin, deps: d }));
 	});
 
-	it("rejects an output_schema that does not compile or carries an unknown type keyword (fail-closed at authoring, bad-input)", async () => {
-		const h = { hyprctl: async (): Promise<HyprctlResult> => ({ code: 0, stdout: "", stderr: "" }) };
-		const d = deps({ hyprctl: h.hyprctl });
-		// unknown `type` keyword at the root: typebox 1.3.x compiles this
-		// silently and its Check never rejects on the type (a typo'd
-		// LLM-authored schema would be silently vacuous — unvalidated data
-		// reported as validated) — the dispatch edge is the named-error gate
-		const msg = await rejectsDispatch("bad-input", () =>
-			dispatchTasks({
-				tasks: [{ agent: "test-agent", task: "t", output_schema: { type: "strng", properties: { x: { type: "string" } }, required: ["x"] } }],
-				mode: "headless",
-				dispatcher: info(),
-				bunBin,
-				deps: d,
-			}),
-		);
-		expect(msg).toContain("unknown type keyword 'strng'");
-		expect(msg).toContain("known types: object, array, string, number, integer, boolean, null");
-		// the walk covers the nested surface (properties + anyOf)
-		const msg2 = await rejectsDispatch("bad-input", () =>
-			dispatchTasks({
-				tasks: [{ agent: "test-agent", task: "t", output_schema: { type: "object", properties: { x: { type: "strng" } }, anyOf: [{ type: "strng2" }] } }],
-				mode: "headless",
-				dispatcher: info(),
-				bunBin,
-				deps: d,
-			}),
-		);
-		expect(msg2).toContain("at properties.x");
-		expect(msg2).toContain("at anyOf[0]");
-		// a schema that does not Compile (typebox throws: an invalid pattern)
-		const msg3 = await rejectsDispatch("bad-input", () =>
-			dispatchTasks({
-				tasks: [{ agent: "test-agent", task: "t", output_schema: { type: "object", properties: { x: { type: "string", pattern: "[invalid" } } } }],
-				mode: "headless",
-				dispatcher: info(),
-				bunBin,
-				deps: d,
-			}),
-		);
-		expect(msg3).toContain("failed to compile");
-	});
 
 	it("an unknown agent is a bad-agent that lists the available names", async () => {
 		const msg = await rejectsDispatch("bad-agent", () =>
@@ -1095,29 +1053,6 @@ describe("admission + queue (2+2, work-conserving — the queue runs under the l
 		}
 	}, 60_000);
 
-	it("output_schema: the declared schema rides spec.json (typed harvest); a non-object is a bad-input", async () => {
-		const schema = { type: "object", properties: { verdict: { type: "string" } }, required: ["verdict"] };
-		const r = await dispatchTasks({
-			tasks: [{ agent: "test-agent", task: "schema ride", output_schema: schema }],
-			mode: "headless",
-			dispatcher: info(),
-			bunBin,
-			deps: deps(),
-		});
-		const w = await waitAll(r.results.map((x) => x.id));
-		expect(w.states[0].state).toBe("completed");
-		expect((await P.readSpec(join(tasksRoot, r.results[0].id))).output_schema).toEqual(schema);
-		// a non-object schema is a bad-input (rejected before any task dir exists)
-		await expect(
-			dispatchTasks({
-				tasks: [{ agent: "test-agent", task: "bad schema", output_schema: [1] as unknown as Record<string, unknown> }],
-				mode: "headless",
-				dispatcher: info(),
-				bunBin,
-				deps: deps(),
-			}),
-		).rejects.toMatchObject({ code: "bad-input" });
-	}, 60_000);
 
 	it("2 tasks across a foreign running task: 1 admitted, 1 queued; the queue runs when the slot frees", async () => {
 		const foreign = await spawnForeignRunning(3500);

@@ -58,8 +58,6 @@ export interface DispatchTaskInput {
 	inactivity?: number;
 	/** Optional — max total session cost (USD); the watchdog settles the task at the budget (reason `cost`). No default — unset means no cost budget. */
 	max_cost_usd?: number;
-	/** Optional — the typed-harvest contract: a JSON Schema (a plain object) the worker's `vitrine_done` `data` payload must satisfy. Rides spec.json; validated at the call (fail-fast). No default — unset means no typed contract (a `data` payload, if any, is recorded unvalidated). */
-	output_schema?: Record<string, unknown>;
 }
 
 /** The dispatcher's self-knowledge (probed: sessionManager + ctx fields). */
@@ -194,22 +192,6 @@ export async function dispatchTasks(opts: DispatchOptions): Promise<DispatchRepo
 		if (t.timeout !== undefined && (typeof t.timeout !== "number" || t.timeout <= 0)) throw new DispatchError("bad-input", "'timeout' must be a positive number of seconds");
 		if (t.inactivity !== undefined && (typeof t.inactivity !== "number" || t.inactivity <= 0)) throw new DispatchError("bad-input", "'inactivity' must be a positive number of seconds");
 		if (t.max_cost_usd !== undefined && (typeof t.max_cost_usd !== "number" || t.max_cost_usd <= 0)) throw new DispatchError("bad-input", "'max_cost_usd' must be a positive number of USD");
-		if (t.output_schema !== undefined && (typeof t.output_schema !== "object" || t.output_schema === null || Array.isArray(t.output_schema))) {
-			throw new DispatchError("bad-input", "'output_schema' must be a plain object (a JSON Schema)");
-		}
-		// The fail-closed authoring-time check (the dispatch edge): a schema
-		// that does not Compile, or that carries an unknown `type` keyword
-		// (typebox silently accepts an unrecognised `type` and its Check
-		// never rejects on it — a typo'd LLM-authored schema would be
-		// silently vacuous), is rejected here with a named error the
-		// dispatcher can fix; the `vitrine_done`-time validation is the
-		// second line
-		if (t.output_schema !== undefined) {
-			const schemaErrors = P.outputSchemaErrors(t.output_schema);
-			if (schemaErrors.length > 0) {
-				throw new DispatchError("bad-input", `task for agent '${t.agent}': ${schemaErrors.join("; ")}`);
-			}
-		}
 	}
 
 	const cfg = C.readConfigSync();
@@ -309,7 +291,6 @@ export async function dispatchTasks(opts: DispatchOptions): Promise<DispatchRepo
 			wall_timeout_s: wallTimeoutS,
 			inactivity_s: inactivityS,
 			max_cost_usd: maxCostUsd,
-			output_schema: input.output_schema,
 			auto_settle_s: cfg.auto_settle_s,
 			auto_settle_grace_s: cfg.auto_settle_grace_s,
 			completed_close_s: cfg.completed_close_s,

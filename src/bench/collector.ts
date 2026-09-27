@@ -198,18 +198,17 @@ export async function collectRow(dir: string): Promise<BenchRow> {
 		const created = firstEv((e) => e.event === "created");
 		const bootEv = firstEv((e) => e.event === "transition" && e.from === "queued" && e.to === "running");
 		const sessionEv = firstEv((e) => e.event === "session");
-		// the marker point: `done-marker` (the protocol write — the real
-		// `vitrine_done` tool appends it BEFORE its own `vitrine_done` event,
-		// and the wrapper's auto-settle/headless-exit writes it directly)
-		// with the `vitrine_done` event as the fallback (the fixture writes
-		// the marker file + that event only — version tolerance)
-		const markerEv = firstEv((e) => e.event === "done-marker" || e.event === "vitrine_done");
+		// the marker point: `done-marker` (the protocol write — every
+		// completion path lands it: the wrapper's stop-settle / auto-settle /
+		// headless-exit writes it, and historical task dirs carry the
+		// `vitrine_done` tool's)
+		const markerEv = firstEv((e) => e.event === "done-marker");
 		const observedEv = firstEv((e) => e.event === "marker-observed");
 		const terminalEv = firstEv((e) => e.event === "transition" && TERMINAL_STATES.has(e.to ?? ""));
 		// The observation point behind poll/settle. The normal path has a
 		// `marker-observed` event (the wrapper's observation of the done-marker).
 		// The headless content-gate completion path (headless.ts branch 3: clean
-		// exit 0, idle assistant, no vitrine_done) writes the done-marker but
+		// exit 0, idle assistant, no marker yet) writes the done-marker but
 		// emits NO marker-observed event — the worker exits and the wrapper
 		// settles. There the `worker-exit` event IS the observation point (it
 		// lands right after the marker, before the terminal transition), so
@@ -218,8 +217,14 @@ export async function collectRow(dir: string): Promise<BenchRow> {
 		// "worker-exit"` so the path stays distinguishable from drift. Genuinely
 		// absent data (no marker, or no worker-exit) stays null (missing).
 		const exitEv = firstEv((e) => e.event === "worker-exit");
-		const observed = observedEv !== undefined ? observedEv : markerEv !== undefined && exitEv !== undefined ? exitEv : undefined;
-		if (observedEv === undefined && observed !== undefined) row.marker_observed_by = "worker-exit";
+		// The stop-settle path (v1.21, tile): the wrapper observes the settled
+		// turn on its tick and writes the marker in the same action — the
+		// `stop-settle` event IS the observation point (the worker is resident,
+		// it never exits at the settle, so the worker-exit fallback below does
+		// not apply). Rows are marked `marker_observed_by: "stop-settle"`.
+		const stopSettleEv = firstEv((e) => e.event === "stop-settle");
+		const observed = observedEv !== undefined ? observedEv : stopSettleEv !== undefined ? stopSettleEv : markerEv !== undefined && exitEv !== undefined ? exitEv : undefined;
+		if (observedEv === undefined && observed !== undefined) row.marker_observed_by = observed === stopSettleEv ? "stop-settle" : "worker-exit";
 
 		const span = (a: Ev | undefined, b: Ev | undefined): number | null => (a !== undefined && b !== undefined ? b.ts - a.ts : null);
 		row.queue_ms = span(created, bootEv);

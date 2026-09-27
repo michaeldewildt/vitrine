@@ -227,10 +227,9 @@ describe("createTask and spec round-trip", () => {
 		expect(await P.readSpec(join(root, id))).toEqual(spec);
 	});
 
-	it("round-trips the full field set (headless, attended, max_cost_usd, from_task_id, output_schema, async)", async () => {
+	it("round-trips the full field set (headless, attended, max_cost_usd, from_task_id, async)", async () => {
 		const id = P.newTaskId();
-		const outputSchema = { type: "object", properties: { verdict: { type: "string" } }, required: ["verdict"] };
-		const spec = { ...makeSpec(id), mode: "headless" as const, attended: true, max_cost_usd: 1.5, from_task_id: P.newTaskId(), output_schema: outputSchema, async: true };
+		const spec = { ...makeSpec(id), mode: "headless" as const, attended: true, max_cost_usd: 1.5, from_task_id: P.newTaskId(), async: true };
 		await P.createTask(join(root, id), spec, PROMPT.replace("<id>", id));
 		expect(await P.readSpec(join(root, id))).toEqual(spec);
 	});
@@ -251,9 +250,6 @@ describe("createTask and spec round-trip", () => {
 			["wall_timeout_s zero", (s) => (s.wall_timeout_s = 0)],
 			["auto_settle_grace_s negative", (s) => (s.auto_settle_grace_s = -5)],
 			["max_cost_usd string", (s) => (s.max_cost_usd = "x")],
-			["output_schema array", (s) => (s.output_schema = [1, 2])],
-			["output_schema string", (s) => (s.output_schema = "x")],
-			["output_schema null", (s) => (s.output_schema = null)],
 			["from_task_id not uuid", (s) => (s.from_task_id = "abc")],
 			["boot_id missing", (s) => delete s.boot_id],
 			["async not boolean", (s) => (s.async = "yes")],
@@ -320,7 +316,7 @@ describe("ordering rule 1 — marker wins", () => {
 		for (const requested of ["killed", "crashed", "timeout", "failed"] as const) {
 			const { dir } = await newTask();
 			await P.transitionState(dir, "queued", "running");
-			await P.writeDoneMarker(dir, "vitrine_done");
+			await P.writeDoneMarker(dir, "stop");
 			const r = await P.transitionState(dir, "running", requested);
 			if (!r.ok) throw new Error(`expected the marker-wins remap, got ${r.code}`);
 			expect(r).toMatchObject({ to: "completed", requested });
@@ -340,7 +336,7 @@ describe("ordering rule 1 — marker wins", () => {
 	it("a direct completed request with the marker present takes the plain path", async () => {
 		const { dir } = await newTask();
 		await P.transitionState(dir, "queued", "running");
-		await P.writeDoneMarker(dir, "vitrine_done");
+		await P.writeDoneMarker(dir, "stop");
 		const r = await P.transitionState(dir, "running", "completed");
 		expect(r).toMatchObject({ ok: true, to: "completed" });
 		expect("requested" in (r as object)).toBe(false);
@@ -354,9 +350,23 @@ describe("ordering rule 1 — marker wins", () => {
 
 	it("done.marker is written once", async () => {
 		const { dir } = await newTask();
+		await P.writeDoneMarker(dir, "stop");
+		expect(await P.readDoneMarker(dir)).toEqual(expect.objectContaining({ source: "stop" }));
+		await rejects("marker-exists", () => P.writeDoneMarker(dir, "auto_settle"));
+	});
+	
+	it("a stop marker round-trips the union (v1.21)", async () => {
+		const { dir } = await newTask();
+		await P.writeDoneMarker(dir, "stop");
+		const m = await P.readDoneMarker(dir);
+		expect(m).toEqual(expect.objectContaining({ source: "stop" }));
+		expect(m?.ts).toBeTypeOf("string");
+	});
+	
+	it("a historical vitrine_done marker still reads (the union keeps legacy dirs valid)", async () => {
+		const { dir } = await newTask();
 		await P.writeDoneMarker(dir, "vitrine_done");
 		expect(await P.readDoneMarker(dir)).toEqual(expect.objectContaining({ source: "vitrine_done" }));
-		await rejects("marker-exists", () => P.writeDoneMarker(dir, "auto_settle"));
 	});
 
 	it("readDoneMarker rejects a marker without a ts", async () => {
@@ -439,7 +449,7 @@ describe("ordering rule 2 — dead-wrapper reconcile", () => {
 		const { dir } = await newTask();
 		const { pid, cp } = await liveSleep();
 		await P.transitionState(dir, "queued", "running", { wrapper_pid: await deadPid(), worker_pid: pid, worker_pid_start: P.pidInfo(pid).startTime });
-		await P.writeDoneMarker(dir, "vitrine_done");
+		await P.writeDoneMarker(dir, "stop");
 		const r = await P.reconcileDeadWrapper(dir);
 		expect(r.outcome).toBe("completed");
 		expect(r.workerKilled).toBe(false);
@@ -455,7 +465,7 @@ describe("ordering rule 2 — dead-wrapper reconcile", () => {
 		const r = await P.reconcileDeadWrapper(dir, {
 			killWorker: async (p) => {
 				expect(p).toBe(pid);
-				await P.writeDoneMarker(dir, "vitrine_done"); // the worker "completes" mid-kill
+				await P.writeDoneMarker(dir, "stop"); // the wrapper's stop-settle lands mid-kill
 			},
 		});
 		expect(r.outcome).toBe("completed");
@@ -536,7 +546,7 @@ describe("session.json, result.md, kill_requested, events, tail", () => {
 		await rejects("no-session", () => P.readSession(join(root, P.newTaskId())));
 	});
 
-	it("result.md is written by the protocol for vitrine_done", async () => {
+	it("result.md is written by the protocol (the harvest path)", async () => {
 		const { dir } = await newTask();
 		await P.writeResult(dir, "final answer");
 		expect(await readFile(join(dir, "result.md"), "utf8")).toBe("final answer");
@@ -631,7 +641,7 @@ describe("environment facts and hygiene", () => {
 		await P.transitionState(dir, "queued", "running", { wrapper_pid: process.pid, foot_pid: process.pid });
 		await P.writeSessionOnce(dir, { session_id: "vitrine.t", session_file: "/tmp/t.jsonl" });
 		await P.writeResult(dir, "done");
-		await P.writeDoneMarker(dir, "vitrine_done");
+		await P.writeDoneMarker(dir, "stop");
 		await P.requestKill(dir);
 		await P.transitionState(dir, "running", "completed");
 		const entries = await readdir(dir);
@@ -723,7 +733,7 @@ describe("reconcileStuckQueued", () => {
 		const id = P.newTaskId();
 		const dir = join(root, id);
 		await P.createTask(dir, makeSpec(id), PROMPT);
-		await P.writeDoneMarker(dir, "vitrine_done");
+		await P.writeDoneMarker(dir, "stop");
 		const created = Date.parse((await P.readSpec(dir)).created_at);
 		const r = await P.reconcileStuckQueued(dir, { now: created + 20_000 });
 		expect(r.settled).toBe("completed");
@@ -802,7 +812,7 @@ describe("reconcileStuckQueued", () => {
 		const id = P.newTaskId();
 		const dir = join(root, id);
 		await P.createTask(dir, makeSpec(id), PROMPT);
-		await P.writeDoneMarker(dir, "vitrine_done");
+		await P.writeDoneMarker(dir, "stop");
 		const created = Date.parse((await P.readSpec(dir)).created_at);
 		const now = created + 20_000;
 		await P.writeLease(dir, { owner: "sess", nonce: "nonce", updated_at: new Date(now - 1_000).toISOString() });

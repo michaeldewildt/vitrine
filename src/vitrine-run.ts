@@ -22,17 +22,21 @@
  * 1. read + validate spec.json; queued → running with the CAS hand-off
  *    (records wrapper_pid + wrapper_pid_start + foot_pid — the hand-off
  *    lost to a sibling is `handoff-lost`, never a double spawn);
- * 2. build the worker argv/env from spec.json (the `--tools`
- *    ceiling unioned with `vitrine_done`);
+ * 2. build the worker argv/env from spec.json (the `--tools` ceiling —
+ *    the agent's non-empty tools list, deduped; no flag on an empty or
+ *    absent list);
  * 3. spawn the worker; record worker_pid + worker_pid_start (CAS field
  *    merge); a rejected merge means a sibling owns the supervision — kill
  *    our worker and exit (zombie-tile guard);
  * 4. session discovery + session.json written ONCE;
- * 5. watchdog ticks (wall / inactivity / cost / auto-settle),
- *    the done-marker poll (rule 1 — the marker always wins), kill handling
- *    (SIGHUP/SIGTERM + kill_requested), the /proc/<foot_pid> backstop
- *    (window closed ⇒ killed);
- * 6. the worker's exit — mapped per mode;
+ * 5. watchdog ticks (wall / cost / stop-settle / inactivity / auto-settle —
+ *    stop-settle: v1.21, the worker's turn settled, unattended ⇒
+ *    `completed (stop)`; inactivity and auto-settle remain the last
+ *    resorts), the done-marker poll (rule 1 — the marker always wins),
+ *    kill handling (SIGHUP/SIGTERM + kill_requested), the /proc/<foot_pid>
+ *    backstop (window closed ⇒ killed);
+ * 6. the worker's exit — mapped per mode (tile: a settled turn on exit
+ *    settles `stop`, as headless already does);
  * 7. v1.11 keep-alive on completed (TILE ONLY): the worker is
  *    NOT killed — the tile stays open in its own regime (no watchdogs: a
  *    stale wallStart would SIGTERM the resident worker; no settle: the

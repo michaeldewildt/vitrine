@@ -57,7 +57,7 @@ export interface AgentFrontmatter {
 	inactivityTimeout?: number;
 	/** The `--tools` allowlist (comma-separated in the file). */
 	tools?: string[];
-	/** `noTools` ⇒ the empty allowlist (`--tools vitrine_done` after the union). */
+	/** `noTools` ⇒ the empty allowlist (no `--tools` flag — the full default surface; the v1.20 union with `vitrine_done` is gone with the tool). */
 	noTools?: boolean;
 }
 

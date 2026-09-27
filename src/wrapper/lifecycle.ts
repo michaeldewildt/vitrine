@@ -398,6 +398,40 @@ async function runLifecycle(taskDir: string, deps: WorkerDeps, mode: Mode): Prom
 		if (!r.ok) log(`settle ${to} rejected (${r.code}); state is ${r.current}`);
 	};
 
+	// v1.21 — the stop-settle / auto-settle shared settle: harvest the last
+	// assistant text (result.md ONLY IF ABSENT — a racing settle's result
+	// wins), write the done marker (the `done-marker` event rides the write),
+	// emit the settle event, settle `completed`, and leave for the
+	// keep-alive phase. `source` is the marker's (the settle's reason
+	// carries it); a marker that lands in the write gap (ordering rule 1)
+	// wins, and the settle takes ITS source.
+	const settleStopped = async (source: P.DoneMarker["source"], event: string): Promise<void> => {
+		const parsedSettle = sessionFile !== null ? await parseSessionEntries(sessionFile).catch(() => null) : null;
+		const harvested = parsedSettle !== null ? (lastAssistantText(parsedSettle.entries) ?? "(no assistant text harvested)") : "(no assistant text harvested)";
+		const rs = await stat(join(d, "result.md")).catch(() => null);
+		if (rs === null) await P.writeResult(d, harvested);
+		let effective = source;
+		try {
+			await P.writeDoneMarker(d, source);
+			await appendEvent({ event, source });
+		} catch (e) {
+			// A racing marker landed in the stat/write gap — ordering rule 1:
+			// its marker wins, so settle `completed` with its source. Without
+			// this catch the exception would kill the wrapper and leave the
+			// worker alive (the hang-after-done case).
+			if (!(e instanceof P.ProtocolError && e.code === "marker-exists")) throw e;
+			const existing = await P.readDoneMarker(d);
+			effective = existing?.source ?? source;
+			await appendEvent({ event: "marker-observed", source: effective });
+		}
+		await settle("completed", effective, getExit());
+		titles?.set("completed");
+		// v1.11 keep-alive: the settle entry point lands in the same phase as
+		// the marker case.
+		kaSnapshot = lastGoodEntryCount;
+		enteredKeepAlive = true;
+	};
+
 	// Point 6 — the partial harvest: the session tail into
 	// tail.log; best effort — it must never block the terminal write.
 	const partialHarvest = async (): Promise<void> => {
@@ -578,6 +612,17 @@ async function runLifecycle(taskDir: string, deps: WorkerDeps, mode: Mode): Prom
 					titles?.render();
 					return "timeout";
 				}
+				case "stop-settle": {
+					// v1.21 — completion on the tick: the worker's turn settled
+					// (idle-assistant) and the tile is unattended. Headless:
+					// structurally OFF (point 7) — its completion channel is the
+					// process exit (the headless-exit marker path), and a
+					// stop-settle here would race it; kept for the evaluator's
+					// contract, like auto-settle.
+					if (mode.kind === "headless") break;
+					await settleStopped("stop", "stop-settle");
+					break;
+				}
 				case "auto-settle": {
 					// Headless: unreachable (unfocusedMs 0 — point 7) — kept
 					// for the evaluator's contract.
@@ -587,32 +632,7 @@ async function runLifecycle(taskDir: string, deps: WorkerDeps, mode: Mode): Prom
 					// a single poll interval.
 					const focusedNow = await mode.focusOnWorker();
 					if (focusedNow) break; // the user just showed up — skip this round
-					const parsedSettle = sessionFile !== null ? await parseSessionEntries(sessionFile).catch(() => null) : null;
-					const harvested = parsedSettle !== null ? (lastAssistantText(parsedSettle.entries) ?? "(no assistant text harvested)") : "(no assistant text harvested)";
-					// harvest only if absent: a racing vitrine_done's result.md
-					// wins (it wrote the result before the marker).
-					const rs = await stat(join(d, "result.md")).catch(() => null);
-					if (rs === null) await P.writeResult(d, harvested);
-					let source = "auto_settle";
-					try {
-						await P.writeDoneMarker(d, "auto_settle");
-						await appendEvent({ event: "auto-settle", source: "auto_settle" });
-					} catch (e) {
-						// The worker's vitrine_done landed in the settle window —
-						// ordering rule 1: its marker wins, so settle `completed`
-						// with the worker's note (and SIGTERM the worker — the
-						// hang-after-done case). Without this catch the exception
-						// would kill the wrapper and leave the worker alive.
-						if (!(e instanceof P.ProtocolError && e.code === "marker-exists")) throw e;
-						source = "worker";
-						await appendEvent({ event: "marker-observed", source: "worker" });
-					}
-					await settle("completed", source, getExit());
-					titles?.set("completed");
-					// v1.11 keep-alive: the auto-settle entry point
-					// lands in the same phase as the marker case.
-					kaSnapshot = lastGoodEntryCount;
-					enteredKeepAlive = true;
+					await settleStopped("auto_settle", "auto-settle");
 					break;
 				}
 				case "wait":
@@ -628,12 +648,15 @@ async function runLifecycle(taskDir: string, deps: WorkerDeps, mode: Mode): Prom
 			}
 
 			// Worker death (the child-exit event, not polling) —
-			// point 4: the exit mapping is mode-specific (tile: killed/
-			// crashed; headless: the 5-branch pinned mapping).
+			// point 4: the exit mapping is mode-specific (tile: stop /
+			// killed / crashed; headless: the 5-branch pinned mapping).
 			if (getExit() !== null && marker === null) {
 				const to = mode.kind === "tile" ? await tileWorkerExit(exitCtx) : await headlessWorkerExit(exitCtx);
 				if (mode.kind === "tile") {
-					titles?.set(to === "killed" ? "killed" : "crashed", to === "killed" ? String(exitCodeOf(getExit()) ?? 0) : undefined);
+					titles?.set(
+						to === "killed" ? "killed" : to === "completed" ? "completed" : "crashed",
+						to === "killed" ? String(exitCodeOf(getExit()) ?? 0) : undefined,
+					);
 					titles?.render();
 				}
 				return to;

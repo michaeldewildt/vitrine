@@ -3,9 +3,11 @@
  * single-writer rule): `session.json` (written exactly once, after spawn),
  * `system-prompt.md` (the worker's `--append-system-prompt` payload, by path
  * — never inline, so the contract stays out of `ps` argv), `result.md` +
- * `done.marker` (`vitrine_done` / auto-settle / headless-exit; the marker is
- * written once and never rewritten — its presence is what ordering rule 1
- * turns into `completed`), `kill_requested` (presence-only).
+ * `done.marker` (stop / auto-settle / headless-exit; historical task dirs
+ * carry `vitrine_done` markers from the retired worker tool — the union
+ * keeps them readable. The marker is written once and never rewritten —
+ * its presence is what ordering rule 1 turns into `completed`),
+ * `kill_requested` (presence-only).
  *
  * "Written once" is stat-then-write: mechanical best-effort; the single
  * writer regime owns the guarantee.
@@ -71,21 +73,10 @@ export async function writeResult(dir: string, text: string): Promise<void> {
 	await atomicWriteFile(join(d, "result.md"), text);
 }
 
-/**
- * Write `result.json` — the typed data payload (`vitrine_done`'s `data`
- * parameter, validated at the call against the task's `output_schema`).
- * Sibling of `writeResult`: the prose answer (`result.md`) and the typed
- * contract (`result.json`) stay orthogonal.
- */
-export async function writeResultJson(dir: string, data: unknown): Promise<void> {
-	const d = await assertTaskDir(dir);
-	await atomicWriteFile(join(d, "result.json"), `${JSON.stringify(data, null, 2)}\n`);
-}
-
 export interface DoneMarker {
 	ts: string;
-	/** `headless-exit` — the wrapper's own marker for a clean `--print` exit: headless completion is the process exit, made durable so ordering rule 1/2 see a marker for a genuinely-finished task. */
-	source: "vitrine_done" | "auto_settle" | "headless-exit";
+	/** `stop` — the wrapper's stop-settle (v1.21: completion observed on the tick — the worker's turn settled, unattended) or the tile worker's terminal stop on exit. `auto_settle` — the quiet-window last resort. `headless-exit` — the wrapper's own marker for a clean `--print` exit: headless completion is the process exit, made durable so ordering rule 1/2 see a marker for a genuinely-finished task. `vitrine_done` — historical only: the retired worker tool wrote these on older task dirs (the union keeps them readable). */
+	source: "vitrine_done" | "auto_settle" | "headless-exit" | "stop";
 }
 
 export async function writeDoneMarker(dir: string, source: DoneMarker["source"]): Promise<void> {
@@ -115,7 +106,7 @@ export async function readDoneMarker(dir: string): Promise<DoneMarker | null> {
 	const m = JSON.parse(raw) as DoneMarker;
 	if (
 		typeof m.ts !== "string" ||
-		(m.source !== "vitrine_done" && m.source !== "auto_settle" && m.source !== "headless-exit")
+		(m.source !== "vitrine_done" && m.source !== "auto_settle" && m.source !== "headless-exit" && m.source !== "stop")
 	) {
 		throw new ProtocolError("bad-marker", `done.marker is malformed: ${raw.slice(0, 120)}`);
 	}
