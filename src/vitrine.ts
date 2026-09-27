@@ -19,7 +19,6 @@
  */
 import { realpathSync } from "node:fs";
 import { open } from "node:fs/promises";
-import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { type ExtensionAPI, type ExtensionToolContext, type ToolResult } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -31,15 +30,6 @@ import { listAgentSummaries } from "./agents";
 const DISPATCH_TOOL = "vitrine_dispatch";
 const COLLECT_TOOL = "vitrine_collect";
 
-/** The vault doctrine file — the single home for the vitrine dispatch/collect
- * instructions. Both tool descriptions carry a pointer here rather than the
- * full doctrine, so the doctrine is edited in the vault and the descriptions
- * cannot drift from it. (The seat roster stays generated in the dispatch
- * description — it comes from the resolver's own layer and cannot live in a
- * file.) Machine-specific path, like the `~/.pi/agent/agents` coupling the
- * resolver already carries. */
-const VITRINE_DOCTRINE = `${process.env.HOME ?? homedir()}/Documents/Agent/Agents/Vitrine.md`;
-
 /** The `vitrine_dispatch` mechanics — the stable opening
  * paragraph of the tool description, VERBATIM; the roster + policy lines
  * are appended at load (see `composeDispatchDescription`). */
@@ -50,19 +40,23 @@ const DISPATCH_MECHANICS =
 	"queued).";
 
 /**
- * The `vitrine_collect` contract — the pull-floor doctrine: dispatch
+ * The `vitrine_collect` mechanics (R9): the pull-floor doctrine — dispatch
  * returns immediately and results arrive as a delivery; collect is the
  * on-demand pull for a result you want now; never busy-poll collect inside
- * a turn. The per-task result shapes and the write semantics live in the
- * vault doctrine file (VITRINE_DOCTRINE) — the description keeps the
- * one-line contract plus the pointer, so the file is the single home for
- * the doctrine and the two cannot drift apart.
+ * a turn. The per-task shapes and the write semantics ride the description
+ * (the tool is its own documentation — the doctrine the delivery's risk
+ * section bounds).
  */
 const COLLECT_MECHANICS =
 	"Pull vitrine results on demand — the complement to vitrine_dispatch (which returns immediately and delivers each harvest on settlement); " +
 	"the way to get a result when you want it now. It answers immediately from disk and NEVER blocks on a running worker — " +
-	"never busy-poll collect inside a turn; the delivery is the result path. " +
-	`Per-task result shapes and write semantics: ${VITRINE_DOCTRINE} (the collect section).`;
+	"never busy-poll collect inside a turn; the delivery is the result path.\n" +
+	"Per task: terminal → the full harvest in the fixed wrapper (capped — the 0600 overflow file's path is named in the body, and reading it " +
+	"is the sanctioned response to a truncated body) + delivery status; running/queued → a status line (state, elapsed, workspace) with no body; " +
+	"a terminal task a human resumed in its tile → the session's latest output as an advisory note (never a state change, never a re-delivery).\n" +
+	"No ids = all tasks of this session plus its fork ancestry; explicit ids (full or the short 8-char prefix) cross any session.\n" +
+	"Harvesting a terminal task writes the harvest-delivered marker — replay and gc treat the task as delivered. " +
+	"Undelivered attended tasks are headlined without a body — attended workspaces are the human's; pulling their harvest is an explicit id.";
 
 /**
  * Compose the `vitrine_dispatch` description:
@@ -88,9 +82,9 @@ export function composeDispatchDescription(): string {
 	}
 	parts.push(
 		"Dispatch when a side task would flood this context, for parallel mechanical units, or for an independent check; not for a single sequential unit or judgment work that needs the conversation.\n" +
-		"Each task's harvest arrives as a delivery on settlement — it never lands in the tool result; never act on a worker's result in the same turn you dispatched it. " +
-		"Full delivery/collect doctrine (per-task result shapes, the harvest-delivered marker, attended tasks): " + VITRINE_DOCTRINE + ".\n" +
-		"Project-local `.pi/agents/` agents shadow these when the project is trusted; an unknown-agent error lists the live roster.",
+			"Each task's harvest arrives as a delivery on settlement — it never lands in the tool result. Never act on a worker's result in the same turn you dispatched it, and never busy-wait for it; " +
+			"vitrine_collect is the on-demand pull for a result you want now (an explicit status check, a re-harvest after a human resumed a worker, or a delivery-path diagnosis) — pull when you want it, never busy-poll collect inside a turn.\n" +
+			"Project-local `.pi/agents/` agents shadow these when the project is trusted; an unknown-agent error lists the live roster.",
 	);
 	return parts.join("\n\n");
 }

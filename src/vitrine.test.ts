@@ -441,10 +441,8 @@ describe("dispatch description (the roster is composed at load)", () => {
 			"Dispatch when a side task would flood this context, for parallel mechanical units, or for an independent check; not for a single sequential unit or judgment work that needs the conversation.",
 		);
 		expect(d).toContain(
-			"Each task's harvest arrives as a delivery on settlement — it never lands in the tool result; never act on a worker's result in the same turn you dispatched it",
+			"Each task's harvest arrives as a delivery on settlement — it never lands in the tool result. Never act on a worker's result in the same turn you dispatched it, and never busy-wait for it; vitrine_collect is the on-demand pull for a result you want now",
 		);
-		// the doctrine moved to the vault file — the description carries the pointer
-		expect(d).toContain("Documents/Agent/Agents/Vitrine.md");
 		expect(d).toContain(
 			"Project-local `.pi/agents/` agents shadow these when the project is trusted; an unknown-agent error lists the live roster.",
 		);
@@ -525,19 +523,19 @@ describe("vitrine_collect (the pull floor + the fork ancestry)", () => {
 		};
 	};
 
-	it("the collect description carries the contract (dispatch returns immediately; collect is the on-demand pull; never busy-poll) + the doctrine pointer", () => {
+	it("the collect description carries the doctrine (dispatch returns immediately; collect is the on-demand pull; never busy-poll)", () => {
 		delete process.env.VITRINE_TASK_DIR;
 		const fake = fakePi();
 		vitrine(fake.api);
 		const collect = fake.tools.find((t) => t.name === "vitrine_collect");
 		expect(collect).toBeDefined();
 		const d = collect!.description ?? "";
-		// the one-line contract: the pull floor, the never-blocks guarantee, no busy-poll
+		// the doctrine: the pull floor, the never-blocks guarantee, the write semantics
 		expect(d).toContain("Pull vitrine results on demand");
 		expect(d).toContain("NEVER blocks on a running worker");
 		expect(d).toContain("never busy-poll collect inside a turn");
-		// the per-task shapes + write semantics moved to the vault doctrine file
-		expect(d).toContain("Documents/Agent/Agents/Vitrine.md");
+		expect(d).toContain("writes the harvest-delivered marker");
+		expect(d).toContain("headlined without a body");
 	});
 
 	/** Walk a typebox schema object for the first node with `type: "array"` (the Optional wrapper nests it under `anyOf`). */
