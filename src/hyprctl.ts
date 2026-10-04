@@ -5,10 +5,17 @@
  * where a NON-ZERO exit is a *result* (`code !== 0`) and only a spawn
  * failure (a string errno like ENOENT) rejects. The call sites apply their
  * own failure policy on top:
- * - the juggle (dispatch): any failure ⇒ degrade (fail-soft);
+ * - the spawn path (dispatch): any failure ⇒ degrade (fail-soft);
  * - the compositor probe (dispatch): `code === 0` ⇒ reachable, else headless;
  * - the wrapper's focus check (wrapper/tile.ts): any error ⇒ FOCUSED
  *   (fail-safe: a human watching can never be auto-completed).
+ *
+ * NOTE — focus FOLLOWS the workspace: `hl.dsp.focus({ window = "pid:N" })`
+ * switches the visible workspace to the target window's. The spawn path
+ * NEVER focuses anything for that reason — it routes the tile silently
+ * (`workspace "N silent"`) and joins it into the panel's group via the
+ * focus-neutral Lua layer (`HL.Group:add`), both as one-shot expressions
+ * (see dispatch/spawn.ts).
  *
  * A bare `hyprctl -j` (no request) is NOT a valid query on this Hyprland
  * (0.56.2) — it exits 1. Compositor reachability is `probeCompositor`;
@@ -63,21 +70,23 @@ export interface WorkerWindow {
 }
 
 /**
- * A window as `hyprctl clients -j` reports it (the juggle's snapshot shape —
- * any class, not just workers).
+ * A window as `hyprctl clients -j` reports it (the spawn prep's snapshot
+ * shape — any class, not just workers).
  */
 export interface AnyWindow {
 	pid: number;
 	class: string;
 	/** Hyprland group ids the window belongs to ([] when ungrouped). */
 	grouped: string[];
+	/** The window's workspace id (absent when the field is missing/malformed). */
+	workspaceId?: number;
 }
 
 /**
- * Live windows from `hyprctl clients -j` — the juggle's single prep snapshot.
+ * Live windows from `hyprctl clients -j` — the spawn prep's single snapshot.
  * `null` on any failure (non-zero code, malformed or
- * missing JSON, non-array body) — the juggle is fail-soft and degrades to
- * the ungrouped behaviour.
+ * missing JSON, non-array body) — the spawn path is fail-soft and degrades
+ * to the plain (no routing, no join) behaviour.
  */
 export async function listAllWindows(
 	hyprctl: (args: string[]) => Promise<HyprctlResult>,
@@ -95,7 +104,9 @@ export async function listAllWindows(
 			const grouped = Array.isArray(w.grouped)
 				? w.grouped.filter((g): g is string => typeof g === "string")
 				: [];
-			out.push({ pid: w.pid, class: typeof w.class === "string" ? w.class : "", grouped });
+			const ws = (w.workspace ?? null) as Record<string, unknown> | null;
+			const workspaceId = ws !== null && typeof ws === "object" && typeof ws.id === "number" ? ws.id : undefined;
+			out.push({ pid: w.pid, class: typeof w.class === "string" ? w.class : "", grouped, ...(workspaceId !== undefined ? { workspaceId } : {}) });
 		}
 		return out;
 	} catch {
@@ -104,9 +115,9 @@ export async function listAllWindows(
 }
 
 /**
- * Live vitrine-worker windows from `hyprctl clients -j` (the join juggle's
+ * Live vitrine-worker windows from `hyprctl clients -j` (the map-wait's
  * snapshot), as a class filter over `listAllWindows`.
- * `null` on any failure — the juggle is fail-soft and degrades to the
+ * `null` on any failure — the spawn path is fail-soft and degrades to the
  * ungrouped behaviour.
  */
 export async function listWorkerWindows(
@@ -114,60 +125,6 @@ export async function listWorkerWindows(
 ): Promise<WorkerWindow[] | null> {
 	const all = await listAllWindows(hyprctl);
 	return all === null ? null : all.filter((w) => w.class === WORKER_APP_ID).map((w) => ({ pid: w.pid, grouped: w.grouped }));
-}
-
-/** The focused window's `{pid, class, grouped}`, or `null` (no window / any failure). */
-export async function readActiveWindow(
-	hyprctl: (args: string[]) => Promise<HyprctlResult>,
-): Promise<{ pid: number; class: string; grouped: string[] } | null> {
-	try {
-		const r = await hyprctl(["activewindow", "-j"]);
-		if (r.code !== 0) return null;
-		const j: unknown = JSON.parse(r.stdout);
-		if (j === null || typeof j !== "object" || Array.isArray(j)) return null;
-		const w = j as Record<string, unknown>;
-		if (typeof w.pid !== "number") return null;
-		const grouped = Array.isArray(w.grouped)
-			? w.grouped.filter((g): g is string => typeof g === "string")
-			: [];
-		return { pid: w.pid, class: typeof w.class === "string" ? w.class : "", grouped };
-	} catch {
-		return null;
-	}
-}
-
-/**
- * Toggle window-group membership of the ACTIVE window
- * (`hl.dsp.group.toggle()`) — the main-agent juggle turns the dispatcher's
- * panel into a group right before a dispatch. The panel MUST
- * be the active window when this is called (the toggle acts on it — never
- * call it without having focused the panel first). `true` on a clean
- * dispatch.
- */
-export async function toggleGroup(hyprctl: (args: string[]) => Promise<HyprctlResult>): Promise<boolean> {
-	try {
-		const r = await hyprctl(["dispatch", "hl.dsp.group.toggle()"]);
-		return r.code === 0;
-	} catch {
-		return false;
-	}
-}
-
-/**
- * Focus a window by pid via the compositor (`hl.dsp.focus({window="pid:N"})`
- * — no workspace switch; the focus lands even when the window is on another
- * workspace). `true` on a clean dispatch, `false` on any failure (fail-soft).
- */
-export async function focusWindowByPid(
-	hyprctl: (args: string[]) => Promise<HyprctlResult>,
-	pid: number,
-): Promise<boolean> {
-	try {
-		const r = await hyprctl(["dispatch", `hl.dsp.focus({ window = "pid:${pid}" })`]);
-		return r.code === 0;
-	} catch {
-		return false;
-	}
 }
 
 /**

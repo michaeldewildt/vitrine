@@ -26,19 +26,18 @@ import {
 	WORKER_APP_ID,
 	countSlots,
 	dispatchTasks,
+	ensureGroupExpression,
 	findDispatcherWindow,
 	findPanelInWindows,
-	focusWindowByPid,
 	harvestTask,
+	joinGroupExpression,
 	listAllWindows,
 	listWorkerWindows,
 	probeCompositor,
-	readActiveWindow,
 	readPpid,
 	renderDispatch,
-	spawnTileWithJoin,
+	spawnTile,
 	tileSpawnArgv,
-	toggleGroup,
 	waitForTasks,
 	type DispatchDeps,
 	type DispatchedTaskResult,
@@ -114,8 +113,8 @@ const info = (): DispatcherInfo => ({
 function deps(over: Partial<DispatchDeps> = {}): DispatchDeps {
 	return {
 		tickMs: 150,
-		// zero-cost map-wait for the legacy tile-spawn tests (the juggle tests
-		// set their own budget + fake clock)
+		// zero-cost map-wait for the legacy tile-spawn tests (the spawn-flow
+		// tests set their own budget + fake clock)
 		mapWaitMs: 1,
 		mapWaitTickMs: 1,
 		sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
@@ -276,6 +275,19 @@ describe("spawn construction (exact argv array)", () => {
 		expect(argv).toEqual(["dispatch", `hl.dsp.exec_cmd("foot -T 'test-agent a1b2c3d4' --app-id vitrine-worker -- /usr/bin/bun /repo/src/vitrine-run.ts /tmp/tasks/xyz")`]);
 	});
 
+	it("tile: a silent workspace route appends the exec rule (the tile opens there WITHOUT switching)", () => {
+		const argv = tileSpawnArgv("test-agent", "a1b2c3d4-0000-0000-0000-000000000000", { command: "/home/u/.local/bin/vitrine-run", args: [], source: "local-bin" }, "/tmp/tasks/xyz", 7);
+		expect(argv).toEqual(["dispatch", `hl.dsp.exec_cmd("foot -T 'test-agent a1b2c3d4' --app-id vitrine-worker -- /home/u/.local/bin/vitrine-run /tmp/tasks/xyz", { workspace = "7 silent" })`]);
+	});
+
+	it("the ensure-grouped IIFE: check-and-toggle in one evaluation (atomic), returns no_op", () => {
+		expect(ensureGroupExpression(200)).toBe(`(function() local p = hl.get_window("pid:200") if p and not p.group then hl.dispatch(hl.dsp.group.toggle({ window = "pid:200" })) end return hl.dsp.no_op() end)()`);
+	});
+
+	it("the join IIFE: fresh resolution, focus-neutral add, idempotent guard, returns no_op", () => {
+		expect(joinGroupExpression(333, 200)).toBe(`(function() local t = hl.get_window("pid:333") local p = hl.get_window("pid:200") if t and p and p.group and not t.group then p.group:add(t) end return hl.dsp.no_op() end)()`);
+	});
+
 	it("probeCompositor: code 0 is reachable, non-zero / rejection is not", async () => {
 		expect(await probeCompositor({ hyprctl: async () => ({ code: 0, stdout: "", stderr: "" }) })).toBe(true);
 		expect(await probeCompositor({ hyprctl: async () => ({ code: 1, stdout: "", stderr: "no" }) })).toBe(false);
@@ -387,7 +399,7 @@ describe("the spawn pass's double-spawn guard (the pass consults the loop's guar
 		// The session's watcher (armed at session_start) ticks in the SAME
 		// process between the pass's awaits and can spawn a pass task before
 		// the pass's own issue reaches it: in tile mode each pass issue is
-		// slow (the join juggle + the delayed exec_cmd), so the watcher's
+		// slow (the spawn path + the delayed exec_cmd), so the watcher's
 		// ticks land inside the pass's issue windows. The pass must consult
 		// the loop's spawn guards (wrapper liveness + spawnInFlight) and
 		// skip a task whose spawn is already in flight — otherwise the task
@@ -463,7 +475,7 @@ describe("the spawn pass's double-spawn guard (the pass consults the loop's guar
 				deps: deps({
 					hyprctl: async (args) => {
 						// the pass's issue window is real: the exec_cmd dispatch
-						// (the spawn call) is delayed, the juggle's other
+						// (the spawn call) is delayed, the spawn path's other
 						// hyprctl calls are fast
 						if (args.join(" ").includes("hl.dsp.exec_cmd")) await new Promise((res) => setTimeout(res, 1200));
 						return { code: 0, stdout: "", stderr: "" };
@@ -494,26 +506,25 @@ describe("the spawn pass's double-spawn guard (the pass consults the loop's guar
 });
 
 // ---------------------------------------------------------------------------
-// join juggle (grouping in v1)
+// silent route + background join (the focus-free spawn flow)
 
-/** A scripted hyprctl for juggle tests; records every call. `focusCode`
- * scripts the `hl.dsp.focus(...)` calls, `toggleCode` the
- * `hl.dsp.group.toggle()` call. */
-function fakeJuggleHyprctl(state: {
-	clients: () => unknown;
-	active: () => unknown;
-	focusCode?: number;
-	toggleCode?: number;
-}): { hyprctl: (args: string[]) => Promise<HyprctlResult>; calls: string[][] } {
+/**
+ * A scripted compositor for the spawnTile tests: a STATEFUL sequence of
+ * `clients -j` window lists (each `clients` call consumes the next list;
+ * the last one repeats), recording every call. `dispatch` calls (the
+ * ensure/join IIFEs) return code 0 and are recorded verbatim.
+ */
+function fakeSpawnCompositor(seq: unknown[][]): { hyprctl: (args: string[]) => Promise<HyprctlResult>; calls: string[][] } {
+	let i = 0;
 	const calls: string[][] = [];
 	const hyprctl = async (args: string[]): Promise<HyprctlResult> => {
 		calls.push(args);
-		if (args[0] === "clients") return { code: 0, stdout: JSON.stringify(state.clients()), stderr: "" };
-		if (args[0] === "activewindow") return { code: 0, stdout: JSON.stringify(state.active()), stderr: "" };
-		if (args[0] === "dispatch") {
-			if ((args[1] ?? "").includes("group.toggle")) return { code: state.toggleCode ?? 0, stdout: "", stderr: "" };
-			return { code: state.focusCode ?? 0, stdout: "", stderr: "" };
+		if (args[0] === "clients") {
+			const list = seq[Math.min(i, seq.length - 1)];
+			i++;
+			return { code: 0, stdout: JSON.stringify(list), stderr: "" };
 		}
+		if (args[0] === "dispatch") return { code: 0, stdout: "", stderr: "" };
 		throw new Error(`unexpected hyprctl args: ${args.join(" ")}`);
 	};
 	return { hyprctl, calls };
@@ -526,237 +537,174 @@ function fakeClock(): { now: () => number; sleep: (ms: number) => Promise<void> 
 }
 
 const workerWin = (pid: number, grouped: string[] = ["0xg"]) => ({ pid, class: WORKER_APP_ID, grouped });
-/** The main-agent panel (the dispatcher's own foot window). */
-const panelWin = (pid: number, grouped: string[] = []) => ({ pid, class: "foot", grouped });
+/** The main-agent panel (the dispatcher's own window), on workspace `ws` when given. */
+const panelWin = (pid: number, grouped: string[] = [], ws?: number) => ({ pid, class: "foot", grouped, ...(ws !== undefined ? { workspace: { id: ws } } : {}) });
 /** A pid chain ending at panel pid 200: start 100 → 150 → 200 (window). */
 const PANEL_DEPS = { startPid: 100, ppidOf: (p: number) => (p === 100 ? 150 : p === 150 ? 200 : null) };
-/** A dead chain (no window on it) — the v1.9 degradation path. */
+/** A dead chain (no window on it) — the plain-spawn degradation path. */
 const NO_PANEL = { startPid: 100, ppidOf: () => null };
 
-describe("join juggle v2 — spawnTileWithJoin (main-agent group)", () => {
-	it("first tile: the panel becomes a group right before the spawn (focus + toggle before the spawn, restore after the map)", async () => {
+/** The spawnTile tests' fixed argv builder (the real tileSpawnArgv bound to a fixture run_path). */
+const TILE_RUN_PATH = { command: "/home/u/.local/bin/vitrine-run", args: [], source: "local-bin" } as C.RunPath;
+const TILE_TITLE = "test-agent a1b2c3d4";
+const buildTileArgv = (workspaceId?: number) => tileSpawnArgv("test-agent", "a1b2c3d4-0000-0000-0000-000000000000", TILE_RUN_PATH, "/tmp/tasks/xyz", workspaceId);
+const dispatchCalls = (calls: string[][]) => calls.filter((a) => a[0] === "dispatch").map((a) => a[1]);
+
+describe("silent route + background join — spawnTile (no focus, ever)", () => {
+	it("ungrouped panel: the atomic ensure IIFE precedes the silent-routed spawn; the join lands after the map (group identity verified)", async () => {
 		const clock = fakeClock();
-		let clientsCalls = 0;
-		let spawnAt = -1;
-		const { hyprctl, calls } = fakeJuggleHyprctl({
-			clients: () => {
-				clientsCalls++;
-				// before the spawn: an ungrouped panel, no workers; after it:
-				// the panel's group + the joined worker
-				return clientsCalls >= 3 ? [panelWin(200, ["0xP"]), workerWin(333, ["0xP"])] : [panelWin(200)];
-			},
-			active: () => ({ pid: 111, class: "foot", grouped: [] }),
-		});
-		const r = await spawnTileWithJoin(
-			async () => {
-				spawnAt = calls.length;
+		const { hyprctl, calls } = fakeSpawnCompositor([
+			// prep: the ungrouped panel on ws 9, no workers
+			[panelWin(200, [], 9)],
+			// map-wait poll: the new worker (333) has mapped
+			[panelWin(200, ["0xP"], 9), workerWin(333, ["0xP"])],
+			// join verify: tile + panel share the group's member set
+			[panelWin(200, ["0xP", "0xT"], 9), workerWin(333, ["0xP", "0xT"])],
+		]);
+		const spawned: string[][] = [];
+		const r = await spawnTile(
+			async (argv) => {
+				spawned.push(argv);
 				return true;
 			},
+			buildTileArgv,
 			{ hyprctl, ...clock, mapWaitMs: 500, mapWaitTickMs: 100, panel: PANEL_DEPS },
 		);
-		expect(r).toEqual({ spawnOk: true, join: { joinedFocus: true, mapped: true, restored: true } });
-		const iFocus = calls.findIndex((a) => a[0] === "dispatch" && a[1]?.includes("pid:200"));
-		const iToggle = calls.findIndex((a) => a[0] === "dispatch" && a[1]?.includes("group.toggle"));
-		const iRestore = calls.findIndex((a) => a[0] === "dispatch" && a[1]?.includes("pid:111"));
-		// the panel is focused BEFORE the toggle (the toggle acts on the
-		// active window — it must never act on the user's window)
-		expect(iFocus).toBeGreaterThanOrEqual(0);
-		expect(iFocus).toBeLessThan(iToggle);
-		// …and both before the spawn; the restore only after it
-		expect(iToggle).toBeLessThan(spawnAt);
-		expect(iRestore).toBeGreaterThan(spawnAt);
+		expect(r).toEqual({ spawnOk: true, mapped: true, joined: true, tilePid: 333, panelPid: 200 });
+		// the silent route: the tile opens on the panel's workspace WITHOUT switching to it
+		expect(spawned).toEqual([["dispatch", `hl.dsp.exec_cmd("foot -T '${TILE_TITLE}' --app-id vitrine-worker -- /home/u/.local/bin/vitrine-run /tmp/tasks/xyz", { workspace = "9 silent" })`]]);
+		// the ONLY dispatch calls: the ensure IIFE + the join IIFE
+		expect(dispatchCalls(calls)).toEqual([ensureGroupExpression(200), joinGroupExpression(333, 200)]);
+		// no focus, ever — the user's workspace/tab/cursor is never touched
+		expect(calls.some((a) => a[0] === "dispatch" && (a[1] ?? "").includes("hl.dsp.focus"))).toBe(false);
 	});
 
-	it("P0 is the panel itself: toggle in place — no focus call, no restore", async () => {
+	it("grouped panel: no ensure — the spawn routes silently and the join lands after the map", async () => {
 		const clock = fakeClock();
-		let clientsCalls = 0;
-		const { hyprctl, calls } = fakeJuggleHyprctl({
-			clients: () => {
-				clientsCalls++;
-				return clientsCalls >= 3 ? [panelWin(200, ["0xP"]), workerWin(333, ["0xP"])] : [panelWin(200)];
-			},
-			active: () => ({ pid: 200, class: "foot", grouped: [] }),
-		});
-		const r = await spawnTileWithJoin(async () => true, { hyprctl, ...clock, mapWaitMs: 500, mapWaitTickMs: 100, panel: PANEL_DEPS });
-		expect(r).toEqual({ spawnOk: true, join: { joinedFocus: true, mapped: true, restored: false } });
-		// exactly one dispatch call: the toggle itself
-		expect(calls.filter((a) => a[0] === "dispatch")).toEqual([[
-			"dispatch",
-			"hl.dsp.group.toggle()",
-		]]);
-	});
-
-	it("panel already grouped, P0 elsewhere: focus the panel's group — no toggle", async () => {
-		const clock = fakeClock();
-		const { hyprctl, calls } = fakeJuggleHyprctl({
-			clients: () => [panelWin(200, ["0xP"]), workerWin(222, ["0xP"])],
-			active: () => ({ pid: 111, class: "foot", grouped: [] }),
-		});
-		const r = await spawnTileWithJoin(async () => true, { hyprctl, ...clock, mapWaitMs: 300, mapWaitTickMs: 100, panel: PANEL_DEPS });
-		expect(r).toEqual({ spawnOk: true, join: { joinedFocus: true, mapped: false, restored: true } });
-		const focusCalls = calls.filter((a) => a[0] === "dispatch");
-		expect(focusCalls.map((a) => a[1])).toEqual([
-			'hl.dsp.focus({ window = "pid:200" })',
-			'hl.dsp.focus({ window = "pid:111" })',
+		const { hyprctl, calls } = fakeSpawnCompositor([
+			[panelWin(200, ["0xP"], 9), workerWin(222, ["0xP"])],
+			[panelWin(200, ["0xP"], 9), workerWin(222, ["0xP"]), workerWin(333, ["0xP"])],
+			[panelWin(200, ["0xP", "0xT"], 9), workerWin(222, ["0xP", "0xT"]), workerWin(333, ["0xP", "0xT"])],
 		]);
+		const r = await spawnTile(async () => true, buildTileArgv, { hyprctl, ...clock, mapWaitMs: 500, mapWaitTickMs: 100, panel: PANEL_DEPS });
+		expect(r).toEqual({ spawnOk: true, mapped: true, joined: true, tilePid: 333, panelPid: 200 });
+		expect(dispatchCalls(calls)).toEqual([joinGroupExpression(333, 200)]); // no ensure
 	});
 
-	it("P0 is a worker in the panel's group: re-assert the panel's focus for the join, no restore", async () => {
-		// 2026-09-19 five-spawn repro: the `set` join resolves against the
-		// group focused at MAP time, so focus is re-asserted for EVERY spawn
-		// — a join makes the new tile the group's active window and
-		// follow_mouse can move focus on the back-to-back map events.
+	it("panel undiscoverable: plain spawn on the current workspace, no ensure, no join (yank-free degradation)", async () => {
 		const clock = fakeClock();
-		const { hyprctl, calls } = fakeJuggleHyprctl({
-			clients: () => [panelWin(200, ["0xP"]), workerWin(222, ["0xP"])],
-			active: () => ({ pid: 222, class: WORKER_APP_ID, grouped: ["0xP"] }),
-		});
-		const r = await spawnTileWithJoin(async () => true, { hyprctl, ...clock, mapWaitMs: 300, mapWaitTickMs: 100, panel: PANEL_DEPS });
-		expect(r).toEqual({ spawnOk: true, join: { joinedFocus: true, mapped: false, restored: false } });
-		expect(calls.filter((a) => a[0] === "dispatch").map((a) => a[1])).toEqual(['hl.dsp.focus({ window = "pid:200" })']);
-	});
-
-	it("P0 is a worker in a legacy (v1.9) group: juggle to the panel's group", async () => {
-		const clock = fakeClock();
-		const { hyprctl, calls } = fakeJuggleHyprctl({
-			clients: () => [panelWin(200, ["0xP"]), workerWin(222, ["0xW"])],
-			active: () => ({ pid: 222, class: WORKER_APP_ID, grouped: ["0xW"] }),
-		});
-		const r = await spawnTileWithJoin(async () => true, { hyprctl, ...clock, mapWaitMs: 300, mapWaitTickMs: 100, panel: PANEL_DEPS });
-		expect(r).toEqual({ spawnOk: true, join: { joinedFocus: true, mapped: false, restored: true } });
-		const focusCalls = calls.filter((a) => a[0] === "dispatch");
-		expect(focusCalls.map((a) => a[1])).toEqual([
-			'hl.dsp.focus({ window = "pid:200" })',
-			'hl.dsp.focus({ window = "pid:222" })',
+		const { hyprctl, calls } = fakeSpawnCompositor([
+			[workerWin(222, ["0xW"])], // no panel on the chain
+			[workerWin(222, ["0xW"]), workerWin(333, [])],
 		]);
-	});
-
-	it("panel undiscoverable (no window on the pid chain): v1.9 degradation — no group call, spawn proceeds", async () => {
-		const clock = fakeClock();
-		const { hyprctl, calls } = fakeJuggleHyprctl({
-			clients: () => [workerWin(222)],
-			active: () => ({ pid: 111, class: "foot", grouped: [] }),
-		});
-		const r = await spawnTileWithJoin(async () => true, { hyprctl, ...clock, mapWaitMs: 300, mapWaitTickMs: 100, panel: NO_PANEL });
-		expect(r).toEqual({ spawnOk: true, join: { joinedFocus: false, mapped: false, restored: false } });
-		expect(calls.filter((a) => a[0] === "dispatch")).toEqual([]);
-	});
-
-	it("panel focus fails: NO toggle — the toggle must never act on the user's window", async () => {
-		const clock = fakeClock();
-		const { hyprctl, calls } = fakeJuggleHyprctl({
-			clients: () => [panelWin(200)],
-			active: () => ({ pid: 111, class: "foot", grouped: [] }),
-			focusCode: 1,
-		});
-		const r = await spawnTileWithJoin(async () => true, { hyprctl, ...clock, mapWaitMs: 300, mapWaitTickMs: 100, panel: PANEL_DEPS });
-		expect(r).toEqual({ spawnOk: true, join: { joinedFocus: false, mapped: false, restored: false } });
-		// exactly the one (failed) focus call — no toggle, no restore
-		expect(calls.filter((a) => a[0] === "dispatch")).toHaveLength(1);
-	});
-
-	it("toggle fails after the focus: restore the user's focus right away (no map to preserve) and degrade", async () => {
-		const clock = fakeClock();
-		let spawnAt = -1;
-		const { hyprctl, calls } = fakeJuggleHyprctl({
-			clients: () => [panelWin(200)],
-			active: () => ({ pid: 111, class: "foot", grouped: [] }),
-			toggleCode: 1,
-		});
-		const r = await spawnTileWithJoin(
-			async () => {
-				spawnAt = calls.length;
+		const spawned: string[][] = [];
+		const r = await spawnTile(
+			async (argv) => {
+				spawned.push(argv);
 				return true;
 			},
-			{ hyprctl, ...clock, mapWaitMs: 300, mapWaitTickMs: 100, panel: PANEL_DEPS },
+			buildTileArgv,
+			{ hyprctl, ...clock, mapWaitMs: 500, mapWaitTickMs: 100, panel: NO_PANEL },
 		);
-		expect(r).toEqual({ spawnOk: true, join: { joinedFocus: false, mapped: false, restored: false } });
-		// focus the panel, the failed toggle, the immediate restore — all
-		// BEFORE the spawn (there is no map-wait to hold the focus for)
-		const dispatchIdxs = calls.reduce<number[]>((acc, a, i) => (a[0] === "dispatch" ? [...acc, i] : acc), []);
-		expect(dispatchIdxs).toHaveLength(3);
-		for (const i of dispatchIdxs) expect(i).toBeLessThan(spawnAt);
-		expect(calls[dispatchIdxs[2]][1]).toContain("pid:111");
+		expect(r).toEqual({ spawnOk: true, mapped: true, joined: false, tilePid: 333, panelPid: null });
+		// plain spawn: NO workspace rule (the tile opens where the user is)
+		expect(spawned[0][1]).toBe(`hl.dsp.exec_cmd("foot -T '${TILE_TITLE}' --app-id vitrine-worker -- /home/u/.local/bin/vitrine-run /tmp/tasks/xyz")`);
+		// no IIFEs at all
+		expect(dispatchCalls(calls)).toEqual([]);
 	});
 
-	it("juggle probe fails (clients throws): spawn proceeds, no juggle", async () => {
+	it("panel without a readable workspace: plain spawn, the join still runs (a cross-workspace add relocates the tile)", async () => {
 		const clock = fakeClock();
-		const hyprctl: (args: string[]) => Promise<HyprctlResult> = async (args) => {
-			if (args[0] === "clients") throw new Error("compositor gone");
-			if (args[0] === "activewindow") return { code: 0, stdout: JSON.stringify({ pid: 111, class: "foot", grouped: [] }), stderr: "" };
-			return { code: 0, stdout: "", stderr: "" };
-		};
-		const r = await spawnTileWithJoin(async () => true, { hyprctl, ...clock, mapWaitMs: 100, mapWaitTickMs: 50, panel: PANEL_DEPS });
-		expect(r.spawnOk).toBe(true);
-		expect(r.join.joinedFocus).toBe(false);
-		expect(r.join.restored).toBe(false);
-	});
-
-	it("juggle probe fails (clients non-zero): same degradation", async () => {
-		const clock = fakeClock();
-		const hyprctl = async (args: string[]): Promise<HyprctlResult> =>
-			args[0] === "clients"
-				? { code: 1, stdout: "", stderr: "boom" }
-				: args[0] === "activewindow"
-					? { code: 0, stdout: JSON.stringify({ pid: 111, class: "foot", grouped: [] }), stderr: "" }
-					: { code: 0, stdout: "", stderr: "" };
-		const r = await spawnTileWithJoin(async () => true, { hyprctl, ...clock, mapWaitMs: 100, mapWaitTickMs: 50, panel: PANEL_DEPS });
-		expect(r.spawnOk).toBe(true);
-		expect(r.join.joinedFocus).toBe(false);
-	});
-
-	it("no focused window (P0 null): no juggle — the panel must NOT be focused (it would strand focus there)", async () => {
-		const clock = fakeClock();
-		const { hyprctl, calls } = fakeJuggleHyprctl({
-			clients: () => [panelWin(200)],
-			active: () => null, // no focused window (or the probe failed)
-		});
-		const r = await spawnTileWithJoin(async () => true, { hyprctl, ...clock, mapWaitMs: 300, mapWaitTickMs: 100, panel: PANEL_DEPS });
-		expect(r).toEqual({ spawnOk: true, join: { joinedFocus: false, mapped: false, restored: false } });
-		expect(calls.filter((a) => a[0] === "dispatch")).toEqual([]);
-	});
-
-	it("map-wait budget exhausted: mapped=false, restore still runs (we moved the focus)", async () => {
-		const clock = fakeClock();
-		const { hyprctl, calls } = fakeJuggleHyprctl({
-			clients: () => [panelWin(200, ["0xP"])], // the new tile never appears
-			active: () => ({ pid: 111, class: "foot", grouped: [] }),
-		});
-		const r = await spawnTileWithJoin(async () => true, { hyprctl, ...clock, mapWaitMs: 300, mapWaitTickMs: 100, panel: PANEL_DEPS });
-		expect(r).toEqual({ spawnOk: true, join: { joinedFocus: true, mapped: false, restored: true } });
-		expect(calls.filter((a) => a[0] === "dispatch")).toHaveLength(2); // focus the panel + restore P0
-	});
-
-	it("spawn failure (throwing): spawnOk=false, no map-wait, restore still runs", async () => {
-		const clock = fakeClock();
-		const { hyprctl, calls } = fakeJuggleHyprctl({
-			clients: () => [panelWin(200, ["0xP"])],
-			active: () => ({ pid: 111, class: "foot", grouped: [] }),
-		});
-		const r = await spawnTileWithJoin(
-			async () => {
-				throw new Error("spawn exploded");
+		const { hyprctl, calls } = fakeSpawnCompositor([
+			[panelWin(200, ["0xP"])], // no workspace field
+			[panelWin(200, ["0xP"]), workerWin(333, ["0xP"])],
+			[panelWin(200, ["0xP", "0xT"]), workerWin(333, ["0xP", "0xT"])],
+		]);
+		const spawned: string[][] = [];
+		const r = await spawnTile(
+			async (argv) => {
+				spawned.push(argv);
+				return true;
 			},
-			{ hyprctl, ...clock, mapWaitMs: 300, mapWaitTickMs: 100, panel: PANEL_DEPS },
+			buildTileArgv,
+			{ hyprctl, ...clock, mapWaitMs: 500, mapWaitTickMs: 100, panel: PANEL_DEPS },
 		);
-		expect(r).toEqual({ spawnOk: false, join: { joinedFocus: true, mapped: false, restored: true } });
-		expect(calls.filter((a) => a[0] === "clients")).toHaveLength(1); // prep only — no map-wait polls
+		expect(r).toEqual({ spawnOk: true, mapped: true, joined: true, tilePid: 333, panelPid: 200 });
+		expect(spawned[0][1]).not.toContain("silent"); // no route
+		expect(dispatchCalls(calls)).toEqual([joinGroupExpression(333, 200)]);
 	});
 
-	it("map-wait budget bounds the polls (500 ms / 100 ms tick ⇒ 5 polls + 1 prep)", async () => {
+	it("spawn failure: no map-wait, no join (the caller settles failed-to-spawn)", async () => {
 		const clock = fakeClock();
-		const { hyprctl, calls } = fakeJuggleHyprctl({
-			clients: () => [panelWin(200, ["0xP"])],
-			active: () => ({ pid: 111, class: "foot", grouped: [] }),
-		});
-		await spawnTileWithJoin(async () => true, { hyprctl, ...clock, mapWaitMs: 500, mapWaitTickMs: 100, panel: PANEL_DEPS });
-		// polls at now=100,200,300,400,500 (≤ the budget); the loop ends once
-		// now reaches the deadline
-		expect(calls.filter((a) => a[0] === "clients")).toHaveLength(6);
+		const { hyprctl, calls } = fakeSpawnCompositor([[panelWin(200, [], 9)]]);
+		const r = await spawnTile(async () => false, buildTileArgv, { hyprctl, ...clock, mapWaitMs: 500, mapWaitTickMs: 100, panel: PANEL_DEPS });
+		expect(r).toEqual({ spawnOk: false, mapped: false, joined: false, tilePid: null, panelPid: 200 });
+		// prep only — the ensure ran (the panel is ungrouped) but the spawn failed
+		expect(calls.filter((a) => a[0] === "clients")).toHaveLength(1);
+		expect(dispatchCalls(calls)).toEqual([ensureGroupExpression(200)]);
+	});
+
+	it("map-wait budget exhausted (the tile never maps): no join is attempted", async () => {
+		const clock = fakeClock();
+		const { hyprctl, calls } = fakeSpawnCompositor([
+			[panelWin(200, ["0xP"], 9)],
+			[panelWin(200, ["0xP"], 9)], // the worker never appears
+		]);
+		const r = await spawnTile(async () => true, buildTileArgv, { hyprctl, ...clock, mapWaitMs: 300, mapWaitTickMs: 100, panel: PANEL_DEPS });
+		expect(r).toEqual({ spawnOk: true, mapped: false, joined: false, tilePid: null, panelPid: 200 });
+		expect(dispatchCalls(calls)).toEqual([]);
+	});
+
+	it("join verify fails (the tile never joined) and the panel is still grouped: one retry, then joined:false", async () => {
+		const clock = fakeClock();
+		const { hyprctl, calls } = fakeSpawnCompositor([
+			[panelWin(200, ["0xP"], 9)],
+			[panelWin(200, ["0xP"], 9), workerWin(333, ["0xP"])],
+			// verify #1: the tile has its own group (the add didn't land)
+			[panelWin(200, ["0xP"], 9), workerWin(333, ["0xT"])],
+			// retry decision: the panel is still grouped
+			[panelWin(200, ["0xP"], 9), workerWin(333, ["0xT"])],
+			// verify #2: still not joined
+			[panelWin(200, ["0xP"], 9), workerWin(333, ["0xT"])],
+		]);
+		const r = await spawnTile(async () => true, buildTileArgv, { hyprctl, ...clock, mapWaitMs: 500, mapWaitTickMs: 100, panel: PANEL_DEPS });
+		expect(r).toEqual({ spawnOk: true, mapped: true, joined: false, tilePid: 333, panelPid: 200 });
+		// join + ONE retry — never more
+		expect(dispatchCalls(calls)).toEqual([joinGroupExpression(333, 200), joinGroupExpression(333, 200)]);
+	});
+
+	it("join verify fails and the panel is ungrouped: no retry (there is no group to join)", async () => {
+		const clock = fakeClock();
+		const { hyprctl, calls } = fakeSpawnCompositor([
+			[panelWin(200, ["0xP"], 9)],
+			[panelWin(200, ["0xP"], 9), workerWin(333, ["0xT"])],
+			// verify #1: not joined; retry decision: the panel is now UNGROUPED
+			[panelWin(200, [], 9), workerWin(333, ["0xT"])],
+		]);
+		const r = await spawnTile(async () => true, buildTileArgv, { hyprctl, ...clock, mapWaitMs: 500, mapWaitTickMs: 100, panel: PANEL_DEPS });
+		expect(r.joined).toBe(false);
+		expect(dispatchCalls(calls)).toEqual([joinGroupExpression(333, 200)]); // no retry
+	});
+
+	it("compositor gone (clients non-zero): plain spawn, no IIFEs (fail-soft)", async () => {
+		const clock = fakeClock();
+		const hyprctl: (args: string[]) => Promise<HyprctlResult> = async (args) =>
+			args[0] === "clients" ? { code: 1, stdout: "", stderr: "boom" } : { code: 0, stdout: "", stderr: "" };
+		const spawned: string[][] = [];
+		const r = await spawnTile(
+			async (argv) => {
+				spawned.push(argv);
+				return true;
+			},
+			buildTileArgv,
+			{ hyprctl, ...clock, mapWaitMs: 100, mapWaitTickMs: 50, panel: PANEL_DEPS },
+		);
+		expect(r).toEqual({ spawnOk: true, mapped: false, joined: false, tilePid: null, panelPid: null });
+		expect(spawned[0][1]).not.toContain("silent");
 	});
 });
 
-describe("juggle probes (clients / activewindow / focus parsing)", () => {
+describe("spawn probes (clients parsing)", () => {
 	it("listWorkerWindows: filters on the app-id, tolerates bad shapes", async () => {
 		const good = async (a: string[]): Promise<HyprctlResult> =>
 			a[0] === "clients"
@@ -771,54 +719,24 @@ describe("juggle probes (clients / activewindow / focus parsing)", () => {
 						stderr: "",
 					}
 					: { code: 1, stdout: "", stderr: "" };
-			const w = await listWorkerWindows(good);
-			expect(w).toEqual([{ pid: 1, grouped: ["0x1"] }, { pid: 3, grouped: [] }]);
-			expect(await listWorkerWindows(async () => ({ code: 1, stdout: "", stderr: "x" }))).toBeNull();
-			expect(await listWorkerWindows(async () => ({ code: 0, stdout: "not json", stderr: "" }))).toBeNull();
-			expect(await listWorkerWindows(async () => ({ code: 0, stdout: "{}", stderr: "" }))).toBeNull();
-			expect(await listWorkerWindows(async () => Promise.reject(new Error("no compositor")))).toBeNull();
+		const w = await listWorkerWindows(good);
+		expect(w).toEqual([{ pid: 1, grouped: ["0x1"] }, { pid: 3, grouped: [] }]);
+		expect(await listWorkerWindows(async () => ({ code: 1, stdout: "", stderr: "x" }))).toBeNull();
+		expect(await listWorkerWindows(async () => ({ code: 0, stdout: "not json", stderr: "" }))).toBeNull();
+		expect(await listWorkerWindows(async () => ({ code: 0, stdout: "{}", stderr: "" }))).toBeNull();
+		expect(await listWorkerWindows(async () => Promise.reject(new Error("no compositor")))).toBeNull();
 	});
 
-	it("readActiveWindow: null on no window / bad shape", async () => {
-		expect(await readActiveWindow(async () => ({ code: 0, stdout: JSON.stringify({ pid: 9, class: "foot" }), stderr: "" })))
-			.toEqual({ pid: 9, class: "foot", grouped: [] });
-		expect(await readActiveWindow(async () => ({ code: 0, stdout: "null", stderr: "" }))).toBeNull();
-		expect(await readActiveWindow(async () => ({ code: 0, stdout: JSON.stringify({ class: "foot" }), stderr: "" }))).toBeNull();
-		expect(await readActiveWindow(async () => ({ code: 1, stdout: "", stderr: "x" }))).toBeNull();
-		// the real Hyprland no-window shape: code 0 with an error body
-		expect(await readActiveWindow(async () => ({ code: 0, stdout: "Invalid", stderr: "" }))).toBeNull();
-	});
-
-	it("focusWindowByPid: dispatches the pid focus; false on failure / throw", async () => {
-		const seen: string[][] = [];
-		expect(await focusWindowByPid(async (a) => { seen.push(a); return { code: 0, stdout: "", stderr: "" }; }, 4242)).toBe(true);
-		expect(seen).toEqual([["dispatch", 'hl.dsp.focus({ window = "pid:4242" })']]);
-		expect(await focusWindowByPid(async () => ({ code: 1, stdout: "", stderr: "x" }), 1)).toBe(false);
-		expect(await focusWindowByPid(async () => Promise.reject(new Error("down")), 1)).toBe(false);
-	});
-
-	it("toggleGroup: dispatches hl.dsp.group.toggle(); false on failure / throw", async () => {
-		const seen: string[][] = [];
-		const ok = async (a: string[]): Promise<HyprctlResult> => {
-			seen.push(a);
-			return { code: 0, stdout: "", stderr: "" };
-		};
-		expect(await toggleGroup(ok)).toBe(true);
-		expect(seen).toEqual([["dispatch", "hl.dsp.group.toggle()"]]);
-		expect(await toggleGroup(async () => ({ code: 1, stdout: "", stderr: "x" }))).toBe(false);
-		expect(await toggleGroup(async () => Promise.reject(new Error("down")))).toBe(false);
-	});
-
-	it("listAllWindows: the full snapshot — tolerates bad shapes", async () => {
+	it("listAllWindows: the full snapshot — parses the workspace id, tolerates bad shapes", async () => {
 		const good = async (a: string[]): Promise<HyprctlResult> =>
 			a[0] === "clients"
 				? {
 						code: 0,
 						stdout: JSON.stringify([
-							{ pid: 1, class: WORKER_APP_ID, grouped: ["0x1", 42, null] },
-							{ pid: 2, class: "foot", grouped: [] },
+							{ pid: 1, class: WORKER_APP_ID, grouped: ["0x1", 42, null], workspace: { id: 9 } },
+							{ pid: 2, class: "foot", grouped: [], workspace: "junk" }, // malformed workspace ⇒ omitted
 							"junk",
-							{ pid: 3 }, // no class ⇒ ""
+							{ pid: 3 }, // no class ⇒ "", no workspace ⇒ omitted
 							{ class: "foot" }, // no pid ⇒ skipped
 						]),
 						stderr: "",
@@ -826,7 +744,7 @@ describe("juggle probes (clients / activewindow / focus parsing)", () => {
 					: { code: 1, stdout: "", stderr: "" };
 		const all = await listAllWindows(good);
 		expect(all).toEqual([
-			{ pid: 1, class: WORKER_APP_ID, grouped: ["0x1"] },
+			{ pid: 1, class: WORKER_APP_ID, grouped: ["0x1"], workspaceId: 9 },
 			{ pid: 2, class: "foot", grouped: [] },
 			{ pid: 3, class: "", grouped: [] },
 		]);
@@ -881,32 +799,32 @@ describe("panel discovery (main-agent group)", () => {
 	});
 });
 
-describe("join juggle through dispatchTasks (per-tile map-wait ordering, main-agent group)", () => {
-	it("two tasks in one call: both tiles join the main-agent panel's group", async () => {
-		// a stateful compositor: the panel (pid 500) starts UNGROUPED; the
-		// toggle groups it; each tile's pid appears in `clients` only after
-		// its own spawn dispatch, inside the panel's group
+describe("tile spawn through dispatchTasks (silent route + background join, per-tile ordering)", () => {
+	it("two tasks in one call: both tiles spawn silent-routed and join the panel's group — zero focus calls", async () => {
+		// a stateful compositor: the panel (pid 500, ws 7) starts UNGROUPED;
+		// the ensure IIFE groups it; each tile's pid appears in `clients` only
+		// after its own spawn dispatch — ungrouped until its join IIFE lands,
+		// after which the group's members all report the SAME member list
 		const panelPid = 500;
 		let panelGrouped = false;
 		const spawnedPids: number[] = [];
+		const joinedPids = new Set<number>();
+		const members = () => [`0x${panelPid}`, ...[...joinedPids].map((p) => `0x${p}`)];
 		const inner = async (args: string[]): Promise<HyprctlResult> => {
 			if (args[0] === "clients") {
-				const wins = [{ pid: panelPid, class: "foot", grouped: panelGrouped ? ["0xP"] : [] }];
-				for (const pid of spawnedPids) wins.push({ pid, class: WORKER_APP_ID, grouped: ["0xP"] });
+				const wins = [{ pid: panelPid, class: "foot", grouped: panelGrouped ? members() : [], workspace: { id: 7 } }];
+				for (const pid of spawnedPids) wins.push({ pid, class: WORKER_APP_ID, grouped: joinedPids.has(pid) ? members() : [], workspace: { id: 7 } });
 				return { code: 0, stdout: JSON.stringify(wins), stderr: "" };
 			}
-			if (args[0] === "activewindow") {
-				return { code: 0, stdout: JSON.stringify({ pid: 111, class: "foot", grouped: [] }), stderr: "" };
-			}
 			if (args[0] === "dispatch") {
-				if (args[1]?.startsWith("hl.dsp.exec_cmd")) {
+				const expr = args[1] ?? "";
+				if (expr.startsWith("hl.dsp.exec_cmd")) {
 					spawnedPids.push(4000 + spawnedPids.length + 1);
 					return { code: 0, stdout: "", stderr: "" };
 				}
-				if (args[1]?.includes("group.toggle")) {
-					panelGrouped = true;
-					return { code: 0, stdout: "", stderr: "" };
-				}
+				if (expr.includes("group.toggle")) panelGrouped = true; // the ensure IIFE
+				const m = expr.match(/t = hl\.get_window\("pid:(\d+)"\)/);
+				if (m !== null && expr.includes("group:add")) joinedPids.add(Number(m[1])); // the join IIFE lands
 				return { code: 0, stdout: "", stderr: "" };
 			}
 			throw new Error(`unexpected: ${args.join(" ")}`);
@@ -922,7 +840,7 @@ describe("join juggle through dispatchTasks (per-tile map-wait ordering, main-ag
 		writeFileSync(localBin, "#!/bin/sh\nexit 0\n");
 		chmodSync(localBin, 0o755);
 		// no abort: the async pass spawns both tiles back-to-back (cap 2, no
-		// foreign) — the per-tile juggle ordering is asserted on the call log
+		// foreign) — the per-tile spawn ordering is asserted on the call log
 		try {
 			await dispatchTasks({
 				tasks: [{ agent: "test-agent", task: "first" }, { agent: "test-agent", task: "second" }],
@@ -939,22 +857,21 @@ describe("join juggle through dispatchTasks (per-tile map-wait ordering, main-ag
 			});
 			const spawnIdxs = calls.reduce<number[]>((acc, a, i) => (a[0] === "dispatch" && a[1]?.startsWith("hl.dsp.exec_cmd") ? [...acc, i] : acc), []);
 			expect(spawnIdxs).toHaveLength(2);
-			// task 1's juggle: focus the panel + make it a group — BOTH before
-			// task 1's spawn (the toggle acts on the active window)
-			const iToggle = calls.findIndex((a) => a[0] === "dispatch" && a[1]?.includes("group.toggle"));
-			expect(iToggle).toBeGreaterThanOrEqual(0);
-			expect(iToggle).toBeLessThan(spawnIdxs[0]);
-			// task 2's juggle: the panel is ALREADY a group — a second focus
-			// (between the spawns), no second toggle (idempotent)
-			const focusIdxs = calls.reduce<number[]>((acc, a, i) => (a[0] === "dispatch" && a[1]?.includes(`pid:${panelPid}`) ? [...acc, i] : acc), []);
-			expect(focusIdxs).toHaveLength(2);
-			expect(focusIdxs[1]).toBeGreaterThan(spawnIdxs[0]);
-			expect(focusIdxs[1]).toBeLessThan(spawnIdxs[1]);
-			// the user's focus is restored after each tile's map — the last
-			// restore only after task 2's spawn
-			const restoreIdxs = calls.reduce<number[]>((acc, a, i) => (a[0] === "dispatch" && a[1]?.includes("pid:111") ? [...acc, i] : acc), []);
-			expect(restoreIdxs).toHaveLength(2);
-			expect(restoreIdxs[1]).toBeGreaterThan(spawnIdxs[1]);
+			// BOTH spawns are silent-routed to the panel's workspace
+			for (const i of spawnIdxs) expect(calls[i][1]).toContain(`workspace = "7 silent"`);
+			// exactly ONE ensure IIFE (task 1 — the panel was ungrouped once;
+			// task 2 finds it grouped): the compositor-atomic check-and-toggle
+			const ensureIdxs = calls.reduce<number[]>((acc, a, i) => (a[0] === "dispatch" && a[1]?.includes("group.toggle") ? [...acc, i] : acc), []);
+			expect(ensureIdxs).toHaveLength(1);
+			expect(ensureIdxs[0]).toBeLessThan(spawnIdxs[0]);
+			// two join IIFEs (one per tile), each AFTER its tile's spawn
+			const joinIdxs = calls.reduce<number[]>((acc, a, i) => (a[0] === "dispatch" && a[1]?.includes("group:add") ? [...acc, i] : acc), []);
+			expect(joinIdxs).toHaveLength(2);
+			expect(joinIdxs[0]).toBeGreaterThan(spawnIdxs[0]);
+			expect(joinIdxs[1]).toBeGreaterThan(spawnIdxs[1]);
+			// the whole point: NO focus call, no standalone toggle, no restore
+			expect(calls.some((a) => a[0] === "dispatch" && (a[1] ?? "").includes("hl.dsp.focus"))).toBe(false);
+			expect(calls.some((a) => a[0] === "dispatch" && a[1] === "hl.dsp.group.toggle()")).toBe(false);
 		} finally {
 			rmSync(localBin, { force: true });
 			// the tile tasks never settle (hyprctl was stubbed, no wrapper ran):

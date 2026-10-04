@@ -14,9 +14,9 @@
  * lives in `loop.ts` (the wait) and `harvest.ts` (the harvest — now the
  * watcher/collect's, not the tool's).
  *
- * The collaborators live beside it: `spawn.ts` (the tile argv + the join
- * juggle + `issueSpawn` + the headless bun resolution + the formatting
- * pieces), `loop.ts` (the reusable wait loop), `harvest.ts` (the result
+ * The collaborators live beside it: `spawn.ts` (the tile argv + the
+ * silent-route/background-join flow + `issueSpawn` + the headless bun
+ * resolution + the formatting pieces), `loop.ts` (the reusable wait loop), `harvest.ts` (the result
  * harvest + the deferred-harvest registry), `admit.ts` (the
  * liveness-qualified slot count + reconciliation).
  */
@@ -83,9 +83,9 @@ export interface DispatchDeps {
 	sleep?: (ms: number) => Promise<void>;
 	/** Poll tick (default 1000 ms — the wait loop's; the entry itself never waits). */
 	tickMs?: number;
-	/** Join-juggle map-wait budget (default 2000 ms, Spawn). */
+	/** Tile-spawn map-wait budget (default 2000 ms, Spawn). */
 	mapWaitMs?: number;
-	/** Join-juggle map-wait tick (default 200 ms). */
+	/** Tile-spawn map-wait tick (default 200 ms). */
 	mapWaitTickMs?: number;
 	/** Main-agent panel discovery (defaults: walk up from `process.ppid`
 	 *  through `/proc` — `panel.ts`; production value, inject for tests). */

@@ -1,10 +1,41 @@
 /**
  * spawn.ts — the dispatch-side spawn construction: the
- * tile-spawn argv (the invariant) + the join juggle (v1.9 grouping),
- * `issueSpawn` (the shared spawn dispatch: tile or headless, with the
- * immediate failure settle), the headless bun-bin resolution, and the
- * small shared formatting pieces (prompt header, elapsed, short id — used
- * by the core + the report + the wait loop).
+ * tile-spawn argv (the invariant) + the silent-route / background-join
+ * flow (`spawnTile`), `issueSpawn` (the shared spawn dispatch: tile or
+ * headless, with the immediate failure settle), the headless bun-bin
+ * resolution, and the small shared formatting pieces (prompt header,
+ * elapsed, short id — used by the core + the report + the wait loop).
+ *
+ * The tile flow (v2 — no focus, ever):
+ * 1. **Prep** — ONE `clients -j`: the panel (the dispatcher's own window)
+ *    + its group state + its workspace, and the pre-spawn worker pids.
+ * 2. **Ensure-grouped** — the panel ungrouped ⇒ a compositor-atomic
+ *    check-and-toggle IIFE (one round trip; a concurrent ensure cannot
+ *    double-toggle — the check and the toggle run inside one compositor-
+ *    serialized Lua evaluation).
+ * 3. **Spawn** — `hl.dsp.exec_cmd` with a per-spawn rule
+ *    `{ workspace = "<panelWs> silent" }`: the tile opens on the panel's
+ *    workspace WITHOUT switching to it, ungrouped (the static rule carries
+ *    no `group` effect — the default is no auto-join), never focused
+ *    (`no_initial_focus`). No workspace switch, no focus steal, no cursor
+ *    warp — the user's view is untouched.
+ * 4. **Map-wait** — poll `clients -j` for the new worker pid (≤ mapWaitMs).
+ * 5. **Join** — a one-shot IIFE resolves both windows fresh at join time
+ *    and `HL.Group:add`s the tile into the panel's group: focus-neutral,
+ *    idempotent (`not t.group` guard), and a cross-workspace add relocates
+ *    the tile to the group's workspace (so a panel that moved between
+ *    spawn and join is self-healing). A group-identity verify (tile and
+ *    panel report the same member set) reports `joined`; one retry on
+ *    verify failure while the panel is grouped.
+ *
+ * Why IIFEs: `hyprctl dispatch` evaluates a Lua EXPRESSION (`return
+ * hl.dispatch(<expr>)`) — a single `(function() … return hl.dsp.no_op()
+ * end)()` runs the multi-step logic statelessly, with no listener, no
+ * config surgery, no persistent state in the compositor. The stock
+ * dispatchers cannot background-join (map-time `group = "set"` requires
+ * the focused window on the tile's own workspace; `into_group` is
+ * active-workspace-scoped and its helper focuses the tile) — the Lua
+ * layer is the only no-focus route (verified live, Hyprland 0.56.2).
  */
 import { spawn } from "node:child_process";
 import { statSync } from "node:fs";
@@ -12,16 +43,13 @@ import { basename, isAbsolute, join } from "node:path";
 import * as C from "../config";
 import * as P from "../protocol";
 import {
-	focusWindowByPid,
 	listAllWindows,
 	listWorkerWindows,
-	readActiveWindow,
-	toggleGroup,
 	WORKER_APP_ID,
 	type HyprctlResult,
 	type WorkerWindow,
 } from "../hyprctl";
-import { findPanelInWindows, type PanelDeps } from "./panel";
+import { findPanelInWindows, type PanelDeps, type PanelWindow } from "./panel";
 
 export const shortId = (id: string): string => id.slice(0, 8);
 
@@ -44,15 +72,44 @@ export function formatElapsed(ms: number): string {
 }
 
 /**
- * The tile-spawn argv (an argv array, no intermediate shell;
- * the dispatch string contains single quotes a shell would eat). The
- * generated paths contain only UUIDs/word chars (the agent name is
- * AGENT_NAME_RE-validated at the spec chokepoint), so the string is
- * dispatch-safe. Named test target.
+ * The tile-spawn argv (an argv array, no intermediate shell; the dispatch
+ * string contains single quotes a shell would eat). The generated paths
+ * contain only UUIDs/word chars (the agent name is AGENT_NAME_RE-
+ * validated at the spec chokepoint), so the string is dispatch-safe.
+ * `workspaceId` adds the silent-route rule (`workspace "N silent"` — the
+ * tile opens on that workspace without switching to it); absent ⇒ plain
+ * spawn on the current workspace (the panel-undiscoverable fallback).
+ * Named test target.
  */
-export function tileSpawnArgv(agentName: string, taskId: string, runPath: C.RunPath, taskDir: string): string[] {
+export function tileSpawnArgv(agentName: string, taskId: string, runPath: C.RunPath, taskDir: string, workspaceId?: number): string[] {
 	const cmd = [runPath.command, ...runPath.args, taskDir].join(" ");
-	return ["dispatch", `hl.dsp.exec_cmd("foot -T '${agentName} ${shortId(taskId)}' --app-id ${WORKER_APP_ID} -- ${cmd}")`];
+	const rules = workspaceId !== undefined ? `, { workspace = "${workspaceId} silent" }` : "";
+	return ["dispatch", `hl.dsp.exec_cmd("foot -T '${agentName} ${shortId(taskId)}' --app-id ${WORKER_APP_ID} -- ${cmd}"${rules})`];
+}
+
+/**
+ * The ensure-grouped expression (one round trip, compositor-atomic):
+ * check-and-toggle on the panel window inside a SINGLE Lua evaluation, so
+ * two concurrent ensures serialize on the compositor's main thread and the
+ * second sees the group the first created (toggle is not idempotent — a
+ * snapshot-then-toggle across two round trips could double-toggle and
+ * dissolve the panel's group).
+ */
+export function ensureGroupExpression(panelPid: number): string {
+	return `(function() local p = hl.get_window("pid:${panelPid}") if p and not p.group then hl.dispatch(hl.dsp.group.toggle({ window = "pid:${panelPid}" })) end return hl.dsp.no_op() end)()`;
+}
+
+/**
+ * The one-shot join expression: `HL.Group:add` on the Lua layer is
+ * focus-neutral (no focus change, no cursor warp, no workspace switch —
+ * verified live) and relocates a cross-workspace window onto the group's
+ * workspace. Both windows are resolved FRESH at join time (a panel that
+ * moved between spawn and join is self-healing); the `not t.group` guard
+ * makes a re-issued join a no-op. Returns `no_op` so the dispatch
+ * evaluates to a valid dispatcher.
+ */
+export function joinGroupExpression(tilePid: number, panelPid: number): string {
+	return `(function() local t = hl.get_window("pid:${tilePid}") local p = hl.get_window("pid:${panelPid}") if t and p and p.group and not t.group then p.group:add(t) end return hl.dsp.no_op() end)()`;
 }
 
 /** The spawn transport environment (the entry's spawn pass and the wait
@@ -81,7 +138,7 @@ export interface SpawnTarget {
 
 /**
  * Issue the spawn command for one task and settle the failure immediately:
- * tile — the hyprctl dispatch through the main-agent join juggle; headless —
+ * tile — the hyprctl exec_cmd dispatch (silent-routed + background join); headless —
  * the detached wrapper spawn. A spawn-command failure settles the task
  * crashed/failed-to-spawn NOW (no waiting out the stuck window for a task
  * that is known not to have launched). Returns whether the spawn command
@@ -107,9 +164,10 @@ export async function issueSpawn(target: SpawnTarget, env: SpawnEnv): Promise<bo
 				// binary, so the `bunBin` thunk is NOT evaluated here (a broken
 				// headless-box bun PATH must not break tiling).
 				const runPath = C.resolveRunPath(env.cfg, "tile");
-				const argv = tileSpawnArgv(target.agentName, target.id, runPath, target.dir);
-				const { spawnOk } = await spawnTileWithJoin(
-					async () => (await env.hyprctl(argv)).code === 0,
+				const buildArgv = (workspaceId?: number) => tileSpawnArgv(target.agentName, target.id, runPath, target.dir, workspaceId);
+				const { spawnOk } = await spawnTile(
+					(argv) => env.hyprctl(argv).then((r) => r.code === 0),
+					buildArgv,
 					{ hyprctl: env.hyprctl, sleep: env.sleep, now: env.now, mapWaitMs: env.mapWaitMs, mapWaitTickMs: env.mapWaitTickMs, panel: env.panel },
 				);
 				return spawnOk;
@@ -148,7 +206,7 @@ export async function issueSpawn(target: SpawnTarget, env: SpawnEnv): Promise<bo
 	return ok;
 }
 
-export interface TileJoinDeps {
+export interface TileSpawnDeps {
 	hyprctl: (args: string[]) => Promise<HyprctlResult>;
 	sleep: (ms: number) => Promise<void>;
 	now: () => number;
@@ -161,122 +219,79 @@ export interface TileJoinDeps {
 	panel?: PanelDeps;
 }
 
-export interface TileJoinOutcome {
-	/** We focused a live worker group before the spawn (join expected). */
-	joinedFocus: boolean;
+export interface TileSpawnOutcome {
+	/** The tile spawn command issued cleanly (code 0). */
+	spawnOk: boolean;
 	/** The new tile was observed mapped within the map-wait budget. */
 	mapped: boolean;
-	/** The user's previous focus was restored after the map. */
-	restored: boolean;
+	/** The tile joined the panel's group (group identity verified). */
+	joined: boolean;
+	/** The tile's window pid (observed at map), `null` when not mapped. */
+	tilePid: number | null;
+	/** The panel's pid, `null` when the panel was undiscoverable (plain spawn). */
+	panelPid: number | null;
 }
 
 /**
- * One tile spawn with the main-agent join juggle (main-agent group): the dispatcher's panel is the group the new tile joins.
+ * One tile spawn with the silent route + background join: the dispatcher's
+ * panel is the group the new tile joins — WITHOUT touching the user's
+ * focus, workspace, or cursor (verified focus-neutral on Hyprland 0.56.2).
  *
- * 1. **Find the panel** — first ancestor of the tool's own process whose pid
- *    is a live window (the panel is owned by the terminal above pi).
- * 2. **Ensure grouped** — already grouped (a previous dispatch made it) ⇒
- *    the join target is that group. Ungrouped ⇒ the panel becomes a group
- *    RIGHT NOW: `hl.dsp.group.toggle()` acts on the ACTIVE window, so the
- *    panel is focused first (only then is the toggle issued — never on the
- *    user's window).
- * 3. **Focus the group** — EVERY spawn re-asserts focus on the panel so
- *    the static rule (`group = "set"`) joins the tile into the focused
- *    unlocked group at MAP time. Focus is never trusted: a join makes the
- *    new tile the group's active window, and with `input:follow_mouse = 1`
- *    the map events of a back-to-back batch can move focus out of the
- *    group — trusted focus let 4/5 tiles open as their own groups (the
- *    2026-09-19 five-spawn repro); pre-spawn focus joins 5/5. P0 not in
- *    the group ⇒ P0 is restored after the map; P0 in the group (the panel
- *    itself, or a worker already in it) ⇒ focus stays in the group, nothing
- *    to restore.
- * 4. **Spawn** (the argv is the invariant — unchanged by this design),
- *    **map-wait** (the join fires at map time, so the focus restore must NOT
- *    precede it), **restore P0** if this juggle moved the focus.
+ * 1. **Prep** — ONE `clients -j`: the panel (pid + group + workspace) and
+ *    the pre-spawn worker pids. Fail-soft: any failure ⇒ plain spawn on the
+ *    current workspace, no join (the panel was not found).
+ * 2. **Ensure grouped** — the panel ungrouped ⇒ the atomic check-and-toggle
+ *    IIFE (one round trip; a concurrent ensure cannot double-toggle).
+ * 3. **Spawn** — silent-routed to the panel's workspace (`workspace "N
+ *    silent"`) when the panel's workspace is known, else plain (current
+ *    workspace). The tile opens ungrouped, never focused.
+ * 4. **Map-wait** — poll `clients -j` for the new worker pid (≤ mapWaitMs).
+ * 5. **Join** — the one-shot IIFE (fresh resolution, focus-neutral, relocates
+ *    a cross-workspace tile). A group-identity verify (tile and panel report
+ *    the same member set) reports `joined`; one retry on verify failure while
+ *    the panel is grouped.
  *
- * Fail-soft: any juggle failure degrades to the v1.9 behaviour (the tile
- * opens as its own group, or joins whatever the compositor happens to have
- * focused); only `spawnTile`'s own failure settles `failed-to-spawn`.
- *
- * Operator-visible behaviour (accepted): while the juggle runs,
- * the user's focus is on the panel's group for the whole map-wait window
- * (≤ mapWaitMs + one probe latency — the deadline is checked BETWEEN
- * polls), and the new tile lands as the group's active window at map time,
- * so the visible tab can swap and keystrokes typed mid-dispatch can land in
- * the new worker's terminal. One more accepted race: with
- * `input:follow_mouse = 1`, a mouse move between the focus call and the
- * map can re-focus the cursor's window — the join then lands in whatever
- * group that left focused (possibly the user's own, or another
- * dispatcher's main group), or drops (the tile opens as its own group).
- * There is no atomic focus+map in the compositor; the map-wait bounds the
- * exposure.
+ * The user's focus/workspace is NEVER moved: there is no focus call and no
+ * restore, because nothing is focused. The compositor-side join is the only
+ * state change, and it is focus-neutral.
  */
-export async function spawnTileWithJoin(
-	spawnTile: () => Promise<boolean>,
-	deps: TileJoinDeps,
-): Promise<{ spawnOk: boolean; join: TileJoinOutcome }> {
+export async function spawnTile(
+	spawn: (argv: string[]) => Promise<boolean>,
+	buildArgv: (workspaceId?: number) => string[],
+	deps: TileSpawnDeps,
+): Promise<TileSpawnOutcome> {
 	const { hyprctl, sleep, now } = deps;
 	const mapWaitMs = deps.mapWaitMs ?? 2000;
 	const tickMs = deps.mapWaitTickMs ?? 200;
 
-	// -- prep: ONE `clients -j` (workers + the panel) + ONE `activewindow -j`
-	//    (P0) — fail-soft throughout ----------------------------------------
-	let joinFocus = false;
-	let restorePid: number | null = null;
+	// -- prep: ONE `clients -j` (workers + the panel) — fail-soft -----------
+	let panel: PanelWindow | null = null;
 	let preWorkerPids = new Set<number>();
 	let snapshotOk = false;
 	try {
 		const all = await listAllWindows(hyprctl);
-		const active = await readActiveWindow(hyprctl);
 		if (all !== null) {
 			preWorkerPids = new Set(all.filter((w) => w.class === WORKER_APP_ID).map((w) => w.pid));
 			snapshotOk = true;
-		}
-		const panel = all === null ? null : findPanelInWindows(all, deps.panel ?? {});
-		if (panel !== null && active !== null) {
-			if (panel.grouped.length > 0) {
-				// Already a group (a previous dispatch made it, idempotent): the join target is that group. Re-assert focus
-				// on the panel for EVERY spawn: the `set` join resolves against
-				// the group focused at MAP time, and focus can leave the group
-				// between this prep and the map (a previous join made its tile
-				// the group's active window; `input:follow_mouse = 1` re-focuses
-				// the cursor's window on map events) — 2026-09-19 five-spawn
-				// repro: trusted focus ⇒ 4/5 strays; pre-spawn focus ⇒ 5/5
-				// joined. P0 in the group ⇒ focus stays in the group after the
-				// map (nothing to restore).
-				const inGroup = active.grouped.length > 0 && panel.grouped[0] === active.grouped[0];
-				restorePid = inGroup ? null : active.pid;
-				joinFocus = await focusWindowByPid(hyprctl, panel.pid);
-			} else if (active.pid === panel.pid) {
-				// The panel becomes a group just before this dispatch. P0
-				// is the panel itself — toggle in place; nothing to restore.
-				joinFocus = await toggleGroup(hyprctl);
-			} else if (await focusWindowByPid(hyprctl, panel.pid)) {
-				// P0 elsewhere: focus the panel FIRST (the toggle acts on the
-				// active window — it must never act on the user's window),
-				// then make it a group.
-				restorePid = active.pid;
-				if (await toggleGroup(hyprctl)) {
-					joinFocus = true; // the panel's new group is the focused group
-				} else {
-					// Focus moved but the toggle failed: no join is possible —
-					// restore the user's focus right away (there is no map to
-					// preserve) and degrade to the v1.9 behaviour.
-					await focusWindowByPid(hyprctl, active.pid);
-					restorePid = null;
-				}
-			}
-			// A failed panel focus ⇒ no group at all (degrade): the tile opens
-			// as its own group, or joins whatever the compositor has focused.
+			panel = findPanelInWindows(all, deps.panel ?? {});
 		}
 	} catch {
-		// fail-soft: skip the juggle, spawn as before
+		panel = null; // fail-soft: plain spawn, no join
 	}
 
-	// -- spawn (the argv is the invariant — see tileSpawnArgv) ---------------
-	const spawnOk = await spawnTile().catch(() => false);
+	const panelPid = panel !== null ? panel.pid : null;
+	const panelWs = panel !== null ? panel.workspaceId : undefined;
 
-	// -- map-wait: the join fires at map time; wait ≤ mapWaitMs --------------
+	// -- ensure grouped (atomic IIFE; only when the panel is ungrouped) ------
+	if (panel !== null && panel.grouped.length === 0) {
+		await hyprctl(["dispatch", ensureGroupExpression(panel.pid)]).catch(() => null);
+	}
+
+	// -- spawn (silent route to the panel's workspace when known) ------------
+	const spawnOk = await spawn(buildArgv(panelWs)).catch(() => false);
+
+	// -- map-wait: observe the new tile (≤ mapWaitMs) -------------------------
+	let tilePid: number | null = null;
 	let mapped = false;
 	if (spawnOk) {
 		const deadline = now() + mapWaitMs;
@@ -290,20 +305,59 @@ export async function spawnTileWithJoin(
 			}
 			// `snapshotOk`: without a prep snapshot an empty preWorkerPids
 			// would make ANY pre-existing worker read as "mapped"
-			if (snapshotOk && workers !== null && workers.some((w) => !preWorkerPids.has(w.pid))) {
-				mapped = true;
-				break;
+			if (snapshotOk && workers !== null) {
+				const fresh = workers.find((w) => !preWorkerPids.has(w.pid));
+				if (fresh !== undefined) {
+					tilePid = fresh.pid;
+					mapped = true;
+					break;
+				}
 			}
 		}
 	}
 
-	// -- restore the user's focus (best-effort, AFTER the map) ---------------
-	let restored = false;
-	if (joinFocus && restorePid !== null) {
-		restored = await focusWindowByPid(hyprctl, restorePid);
+	// -- join (one-shot IIFE) + verify (group identity) + one retry ----------
+	let joined = false;
+	if (spawnOk && mapped && tilePid !== null && panel !== null) {
+		const doJoin = async (): Promise<boolean> => {
+			await hyprctl(["dispatch", joinGroupExpression(tilePid!, panel!.pid)]).catch(() => null);
+			return await sameGroup(hyprctl, tilePid!, panel!.pid);
+		};
+		joined = await doJoin();
+		if (!joined) {
+			// one retry — only if the panel actually has a group to join
+			const stillGrouped = await panelIsGrouped(hyprctl, panel.pid);
+			if (stillGrouped) joined = await doJoin();
+		}
 	}
 
-	return { spawnOk, join: { joinedFocus: joinFocus, mapped, restored } };
+	return { spawnOk, mapped, joined, tilePid, panelPid };
+}
+
+/**
+ * Group-identity verify: the tile and the panel report the SAME member set
+ * (same group). Reads ONE `clients -j`. `false` on any failure, an
+ * ungrouped tile/panel, or a mismatched member set.
+ */
+async function sameGroup(hyprctl: (args: string[]) => Promise<HyprctlResult>, tilePid: number, panelPid: number): Promise<boolean> {
+	const all = await listAllWindows(hyprctl).catch(() => null);
+	if (all === null) return false;
+	const tile = all.find((w) => w.pid === tilePid);
+	const panel = all.find((w) => w.pid === panelPid);
+	if (tile === undefined || panel === undefined) return false;
+	if (tile.grouped.length === 0 || panel.grouped.length === 0) return false;
+	const a = [...tile.grouped].sort();
+	const b = [...panel.grouped].sort();
+	if (a.length !== b.length) return false;
+	return a.every((g, i) => g === b[i]);
+}
+
+/** `true` when the panel window is currently in a group (one `clients -j`). */
+async function panelIsGrouped(hyprctl: (args: string[]) => Promise<HyprctlResult>, panelPid: number): Promise<boolean> {
+	const all = await listAllWindows(hyprctl).catch(() => null);
+	if (all === null) return false;
+	const panel = all.find((w) => w.pid === panelPid);
+	return panel !== undefined && panel.grouped.length > 0;
 }
 
 /**

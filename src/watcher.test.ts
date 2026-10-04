@@ -1088,11 +1088,11 @@ describe("the spawn-issued guard (the in-flight window)", () => {
 		await writeFile(runBin, `#!/bin/sh\nexit 0\n`);
 		chmodSync(runBin, 0o755);
 		const env: SpawnEnv = {
-			mode: "tile", // the issue window is real here: the join juggle runs 1–2 s
+			mode: "tile", // the issue window is real here: the tile spawn runs 1–2 s
 			cfg: { ...C.readConfigSync(), run_path: runBin },
 			bunBin: () => "unused", // tile mode never resolves the bun bin
 			// the SPAWN call (the exec_cmd dispatch) is delayed — the issue
-			// window is observable; the juggle's other hyprctl calls are fast
+			// window is observable; the spawn path's other hyprctl calls are fast
 			hyprctl: async (args: string[]) => {
 				if (args.join(" ").includes("hl.dsp.exec_cmd")) await new Promise((r) => setTimeout(r, 1200));
 				return { code: 0, stdout: "", stderr: "" };

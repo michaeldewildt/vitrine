@@ -105,8 +105,8 @@ export function createTitleKit(attended: boolean, label: string, writeTitle: (ti
  * The default focus check: `hyprctl activewindow -j` — the tile
  * is focused iff `.pid === foot_pid`; any error/timeout counts as FOCUSED
  * (fail-safe: a human watching can never be auto-completed). Note the
- * asymmetry with the dispatcher's juggle reads (any error ⇒ degrade): the
- * two fail in opposite directions on purpose.
+ * asymmetry with the dispatcher's spawn-path reads (any error ⇒ degrade):
+ * the two fail in opposite directions on purpose.
  */
 export function focusOnWorkerCheck(footPid: number): () => Promise<boolean> {
 	return async () => {

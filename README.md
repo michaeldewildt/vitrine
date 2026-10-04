@@ -67,7 +67,7 @@ Vitrine adds two primitives to your main session — `vitrine_dispatch` (the pus
 
 ## Why Hyprland, why foot
 
-**Hyprland** is the load-bearing dependency, and it earns the place with three gifts: it can **spawn** (workers are descendants of the compositor — the survival property), it can **group** (a batch is one window group anchored by the dispatcher's panel), and it can be **queried** (`hyprctl` — the focus juggle, the liveness checks, the window enumeration).
+**Hyprland** is the load-bearing dependency, and it earns the place with three gifts: it can **spawn** (workers are descendants of the compositor — the survival property), it can **group** (a batch is one window group anchored by the dispatcher's panel — the join lands in the background, no focus steal), and it can be **queried** (`hyprctl` — the liveness checks, the window enumeration).
 
 **foot** is the verified terminal, not an architectural commitment. The requirement is topology, not brand: one process per window (the window owns the pty — closing the tile SIGHUPs the wrapper, and the window's pid is the task's distinct, stable identity) and a per-launch app-id (`--app-id vitrine-worker`) so the static window rule matches workers and never your manual terminals. foot is pinned today; the swap seam is one spawn argv, and a config key is the planned path if a different terminal is wanted.
 
@@ -93,7 +93,7 @@ src/wrapper/                          the wrapper → protocol, session, hyprctl
   lifecycle.ts (ONE loop for both modes — the seven-point mode contract)
 src/vitrine-run.ts                    the wrapper bin entry (shebang) + stable re-exports
 src/dispatch/                         the dispatch core — re-exported via src/dispatch.ts
-  core.ts (surface + dispatchTasks + the R1 report) · spawn.ts (tile argv + juggle + bun) ·
+  core.ts (surface + dispatchTasks + the R1 report) · spawn.ts (tile argv + silent route + background join + bun) ·
   loop.ts (the reusable wait loop — the watcher's mechanism: spawn/admit/poll + the spawn-issued guard) ·
   harvest.ts (result harvest + the shared cap mechanism + deferred registry) ·
   admit.ts (slot count + reconciliation) · panel.ts (the dispatcher window/panel facts)
@@ -147,7 +147,7 @@ pi install git:github.com/michaeldewildt/vitrine
 - the pi extension package registers **in place** (the repo tree is used directly — a git pull updates the live extension)
 - `~/.local/bin/vitrine-run` + `~/.local/bin/vitrine`: `#!/bin/sh` exec-wrappers with the **absolute bun path pinned at install time** (the compositor's `sh -c` layer is not a login shell — a mise bun shim won't resolve there). Re-run after a bun upgrade.
 - config at `~/.vitrine/config.json` (`0600`, auto-created on first read; `VITRINE_CONFIG` overrides the path)
-- one Hyprland window rule keyed on app-id `vitrine-worker` (omarchy convention, added with sign-off — the tile opens on the current workspace as a group the concurrent workers join): `o.window("vitrine-worker", { no_initial_focus = true, group = "set" })`
+- one Hyprland window rule keyed on app-id `vitrine-worker` (omarchy convention, added with sign-off — the tile opens without stealing focus; the background join then anchors it to the dispatcher's group): `o.window("vitrine-worker", { no_initial_focus = true })`
 
 ## Requirements
 

@@ -7,9 +7,9 @@
  * (`hyprctl clients -j`). Proven live 2026-09-18: `pi → bash → foot`, foot
  * is the panel's window pid (two hops).
  *
- * Fail-soft by design: no window on the chain ⇒ `null` ⇒ the juggle
- * degrades (the tile opens as its own group, or joins whatever the
- * compositor has focused — the v1.9 behaviour). The walk only reads
+ * Fail-soft by design: no window on the chain ⇒ `null` ⇒ the spawn path
+ * degrades (the tile opens ungrouped on the current workspace — no
+ * routing, no join). The walk only reads
  * `/proc/<pid>/stat` (field 4 = ppid); it never writes.
  */
 import { readFileSync } from "node:fs";
@@ -20,6 +20,8 @@ export interface PanelWindow {
 	pid: number;
 	/** Hyprland group ids the panel belongs to ([] when ungrouped). */
 	grouped: string[];
+	/** The panel's workspace id (absent when unreadable). */
+	workspaceId?: number;
 }
 
 export interface PanelDeps {
@@ -64,7 +66,7 @@ export function findPanelInWindows(windows: AnyWindow[], deps: PanelDeps = {}): 
 	let cur = deps.startPid ?? process.ppid;
 	for (let i = 0; i < maxHops; i++) {
 		const w = byPid.get(cur);
-		if (w) return { pid: w.pid, grouped: w.grouped };
+		if (w) return { pid: w.pid, grouped: w.grouped, ...(w.workspaceId !== undefined ? { workspaceId: w.workspaceId } : {}) };
 		const next = ppidOf(cur);
 		if (next === null || next <= 1 || next === cur) return null;
 		cur = next;
