@@ -147,7 +147,7 @@ pi install git:github.com/michaeldewildt/vitrine
 - the pi extension package registers **in place** (the repo tree is used directly — a git pull updates the live extension)
 - `~/.local/bin/vitrine-run` + `~/.local/bin/vitrine`: `#!/bin/sh` exec-wrappers with the **absolute bun path pinned at install time** (the compositor's `sh -c` layer is not a login shell — a mise bun shim won't resolve there). Re-run after a bun upgrade.
 - config at `~/.vitrine/config.json` (`0600`, auto-created on first read; `VITRINE_CONFIG` overrides the path)
-- one Hyprland window rule keyed on app-id `vitrine-worker` (omarchy convention, added with sign-off — the tile opens without stealing focus; the background join then anchors it to the dispatcher's group): `o.window("vitrine-worker", { no_initial_focus = true })`
+- one Hyprland window rule keyed on app-id `vitrine-worker` (omarchy convention, added with sign-off — the tile opens without stealing focus): `o.window("vitrine-worker", { no_initial_focus = true })`. Group placement and the open animation are the spawn's own business, not the machine's: the per-spawn exec rules carry `group = "barred"` (the opt-out of the compositor's auto_group — default on — which would otherwise pull a first-mapped window into the FOCUSED window's group, i.e. the group under the cursor, whenever the workspaces match; the rule is first-map-scoped, so the background join still lands the tile in the panel's group) and `no_anim = true` (the tile opens at its final geometry — no open/reposition animation).
 
 ## Requirements
 

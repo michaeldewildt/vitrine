@@ -267,17 +267,17 @@ describe("source guards (terminal + session.json)", () => {
 describe("spawn construction (exact argv array)", () => {
 	it("tile: a direct-executable run_path", () => {
 		const argv = tileSpawnArgv("test-agent", "a1b2c3d4-0000-0000-0000-000000000000", { command: "/home/u/.local/bin/vitrine-run", args: [], source: "local-bin" }, "/tmp/tasks/xyz");
-		expect(argv).toEqual(["dispatch", `hl.dsp.exec_cmd("foot -T 'test-agent a1b2c3d4' --app-id vitrine-worker -- /home/u/.local/bin/vitrine-run /tmp/tasks/xyz")`]);
+		expect(argv).toEqual(["dispatch", `hl.dsp.exec_cmd("foot -T 'test-agent a1b2c3d4' --app-id vitrine-worker -- /home/u/.local/bin/vitrine-run /tmp/tasks/xyz", { group = "barred", no_anim = true })`]);
 	});
 
 	it("tile: the bun + script run_path carries both", () => {
 		const argv = tileSpawnArgv("test-agent", "a1b2c3d4-0000-0000-0000-000000000000", { command: "/usr/bin/bun", args: ["/repo/src/vitrine-run.ts"], source: "in-place" }, "/tmp/tasks/xyz");
-		expect(argv).toEqual(["dispatch", `hl.dsp.exec_cmd("foot -T 'test-agent a1b2c3d4' --app-id vitrine-worker -- /usr/bin/bun /repo/src/vitrine-run.ts /tmp/tasks/xyz")`]);
+		expect(argv).toEqual(["dispatch", `hl.dsp.exec_cmd("foot -T 'test-agent a1b2c3d4' --app-id vitrine-worker -- /usr/bin/bun /repo/src/vitrine-run.ts /tmp/tasks/xyz", { group = "barred", no_anim = true })`]);
 	});
 
 	it("tile: a silent workspace route appends the exec rule (the tile opens there WITHOUT switching)", () => {
 		const argv = tileSpawnArgv("test-agent", "a1b2c3d4-0000-0000-0000-000000000000", { command: "/home/u/.local/bin/vitrine-run", args: [], source: "local-bin" }, "/tmp/tasks/xyz", 7);
-		expect(argv).toEqual(["dispatch", `hl.dsp.exec_cmd("foot -T 'test-agent a1b2c3d4' --app-id vitrine-worker -- /home/u/.local/bin/vitrine-run /tmp/tasks/xyz", { workspace = "7 silent" })`]);
+		expect(argv).toEqual(["dispatch", `hl.dsp.exec_cmd("foot -T 'test-agent a1b2c3d4' --app-id vitrine-worker -- /home/u/.local/bin/vitrine-run /tmp/tasks/xyz", { workspace = "7 silent", group = "barred", no_anim = true })`]);
 	});
 
 	it("the ensure-grouped IIFE: check-and-toggle in one evaluation (atomic), returns no_op", () => {
@@ -572,7 +572,7 @@ describe("silent route + background join — spawnTile (no focus, ever)", () => 
 		);
 		expect(r).toEqual({ spawnOk: true, mapped: true, joined: true, tilePid: 333, panelPid: 200 });
 		// the silent route: the tile opens on the panel's workspace WITHOUT switching to it
-		expect(spawned).toEqual([["dispatch", `hl.dsp.exec_cmd("foot -T '${TILE_TITLE}' --app-id vitrine-worker -- /home/u/.local/bin/vitrine-run /tmp/tasks/xyz", { workspace = "9 silent" })`]]);
+		expect(spawned).toEqual([["dispatch", `hl.dsp.exec_cmd("foot -T '${TILE_TITLE}' --app-id vitrine-worker -- /home/u/.local/bin/vitrine-run /tmp/tasks/xyz", { workspace = "9 silent", group = "barred", no_anim = true })`]]);
 		// the ONLY dispatch calls: the ensure IIFE + the join IIFE
 		expect(dispatchCalls(calls)).toEqual([ensureGroupExpression(200), joinGroupExpression(333, 200)]);
 		// no focus, ever — the user's workspace/tab/cursor is never touched
@@ -607,8 +607,8 @@ describe("silent route + background join — spawnTile (no focus, ever)", () => 
 			{ hyprctl, ...clock, mapWaitMs: 500, mapWaitTickMs: 100, panel: NO_PANEL },
 		);
 		expect(r).toEqual({ spawnOk: true, mapped: true, joined: false, tilePid: 333, panelPid: null });
-		// plain spawn: NO workspace rule (the tile opens where the user is)
-		expect(spawned[0][1]).toBe(`hl.dsp.exec_cmd("foot -T '${TILE_TITLE}' --app-id vitrine-worker -- /home/u/.local/bin/vitrine-run /tmp/tasks/xyz")`);
+		// plain spawn: NO workspace rule (the tile opens where the user is) — but still barred + animation-free
+		expect(spawned[0][1]).toBe(`hl.dsp.exec_cmd("foot -T '${TILE_TITLE}' --app-id vitrine-worker -- /home/u/.local/bin/vitrine-run /tmp/tasks/xyz", { group = "barred", no_anim = true })`);
 		// no IIFEs at all
 		expect(dispatchCalls(calls)).toEqual([]);
 	});

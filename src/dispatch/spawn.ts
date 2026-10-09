@@ -13,11 +13,16 @@
  *    check-and-toggle IIFE (one round trip; a concurrent ensure cannot
  *    double-toggle — the check and the toggle run inside one compositor-
  *    serialized Lua evaluation).
- * 3. **Spawn** — `hl.dsp.exec_cmd` with a per-spawn rule
- *    `{ workspace = "<panelWs> silent" }`: the tile opens on the panel's
- *    workspace WITHOUT switching to it, ungrouped (the static rule carries
- *    no `group` effect — the default is no auto-join), never focused
- *    (`no_initial_focus`). No workspace switch, no focus steal, no cursor
+ * 3. **Spawn** — `hl.dsp.exec_cmd` with the per-spawn rules `{ workspace =
+ *    "<panelWs> silent", group = "barred", no_anim = true }`: the tile opens
+ *    on the panel's workspace WITHOUT switching to it, ungrouped — `barred`
+ *    is the opt-out of the compositor's auto_group (default ON), which would
+ *    otherwise pull a first-mapped window into the FOCUSED window's group
+ *    (the group under the cursor) whenever the workspaces match; it is
+ *    first-map-scoped, so the explicit join still lands the tile in the
+ *    panel's group — and `no_anim` opens the tile at its final geometry,
+ *    no open/reposition animation. Never focused (`no_initial_focus`, the
+ *    machine window rule). No workspace switch, no focus steal, no cursor
  *    warp — the user's view is untouched.
  * 4. **Map-wait** — poll `clients -j` for the new worker pid (≤ mapWaitMs).
  * 5. **Join** — a one-shot IIFE resolves both windows fresh at join time
@@ -76,14 +81,23 @@ export function formatElapsed(ms: number): string {
  * string contains single quotes a shell would eat). The generated paths
  * contain only UUIDs/word chars (the agent name is AGENT_NAME_RE-
  * validated at the spec chokepoint), so the string is dispatch-safe.
- * `workspaceId` adds the silent-route rule (`workspace "N silent"` — the
- * tile opens on that workspace without switching to it); absent ⇒ plain
- * spawn on the current workspace (the panel-undiscoverable fallback).
- * Named test target.
+ * The per-spawn exec rules always carry `group = "barred"` — Hyprland's
+ * auto_group (default on) pulls a newly-mapped window into the FOCUSED
+ * window's group at first map (i.e. the group under the cursor) when the
+ * workspaces match; `barred` keeps the tile ungrouped at map time while
+ * remaining scoped to the first map, so the explicit background join
+ * (`HL.Group:add`, post-map) still lands it in the panel's group — and
+ * `no_anim = true` opens the tile at its final geometry (no open/reposition
+ * animation). `workspaceId` adds the silent-route rule (`workspace "N
+ * silent"` — the tile opens on that workspace without switching to it);
+ * absent ⇒ spawn on the current workspace (the panel-undiscoverable
+ * fallback, still barred + animation-free). Named test target.
  */
 export function tileSpawnArgv(agentName: string, taskId: string, runPath: C.RunPath, taskDir: string, workspaceId?: number): string[] {
 	const cmd = [runPath.command, ...runPath.args, taskDir].join(" ");
-	const rules = workspaceId !== undefined ? `, { workspace = "${workspaceId} silent" }` : "";
+	const rules = workspaceId !== undefined
+		? `, { workspace = "${workspaceId} silent", group = "barred", no_anim = true }`
+		: `, { group = "barred", no_anim = true }`;
 	return ["dispatch", `hl.dsp.exec_cmd("foot -T '${agentName} ${shortId(taskId)}' --app-id ${WORKER_APP_ID} -- ${cmd}"${rules})`];
 }
 
@@ -243,8 +257,10 @@ export interface TileSpawnOutcome {
  * 2. **Ensure grouped** — the panel ungrouped ⇒ the atomic check-and-toggle
  *    IIFE (one round trip; a concurrent ensure cannot double-toggle).
  * 3. **Spawn** — silent-routed to the panel's workspace (`workspace "N
- *    silent"`) when the panel's workspace is known, else plain (current
- *    workspace). The tile opens ungrouped, never focused.
+ *    silent"`) when the panel's workspace is known, else current
+ *    workspace. The tile opens ungrouped (the `group = "barred"` exec rule
+ *    opts out of the compositor's auto-group into the focused window's
+ *    group) and animation-free (`no_anim = true`), never focused.
  * 4. **Map-wait** — poll `clients -j` for the new worker pid (≤ mapWaitMs).
  * 5. **Join** — the one-shot IIFE (fresh resolution, focus-neutral, relocates
  *    a cross-workspace tile). A group-identity verify (tile and panel report
